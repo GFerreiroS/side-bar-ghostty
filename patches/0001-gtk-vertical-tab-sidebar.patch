@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..18ed9b7
+index 0000000..eae8554
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,903 @@
+@@ -0,0 +1,935 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -208,6 +208,8 @@ index 0000000..18ed9b7
 +        list_view: *gtk.ListView,
 +        new_tab_button: *gtk.Button,
 +        new_tab_label: *gtk.Label,
++        overview_button: *gtk.Button,
++        menu_button: *gtk.MenuButton,
 +
 +        pub var offset: c_int = 0;
 +    };
@@ -237,6 +239,18 @@ index 0000000..18ed9b7
 +            0,
 +            animation_ms,
 +            target.as(adw.AnimationTarget),
++        );
++
++        // Hide on `done` rather than trusting the width to reach zero. The
++        // widget's natural width can exceed its size request, so animating
++        // to zero does not necessarily shrink it to nothing -- which left
++        // the rail on screen after closing back down to a single tab.
++        _ = adw.Animation.signals.done.connect(
++            priv.animation.?.as(adw.Animation),
++            *Self,
++            &animationDone,
++            self,
++            .{},
 +        );
 +
 +        // Entering expands instantly; leaving collapses after a delay.
@@ -404,6 +418,17 @@ index 0000000..18ed9b7
 +        const label = priv.new_tab_label.as(gtk.Widget);
 +        label.setOpacity(opacity);
 +        label.setVisible(shown);
++
++        // The overview and menu buttons live in the same row as "New Tab".
++        // They only exist once there is room for them, and the "+" gives up
++        // its width to make space rather than the row rearranging.
++        for ([_]*gtk.Widget{
++            priv.overview_button.as(gtk.Widget),
++            priv.menu_button.as(gtk.Widget),
++        }) |w| {
++            w.setOpacity(opacity);
++            w.setVisible(shown);
++        }
 +    }
 +
 +    /// Animate the sidebar width to `target`, starting from wherever the
@@ -424,6 +449,11 @@ index 0000000..18ed9b7
 +        anim.setValueFrom(priv.current_width);
 +        anim.setValueTo(target);
 +        anim.as(adw.Animation).play();
++    }
++
++    fn animationDone(_: *adw.Animation, self: *Self) callconv(.c) void {
++        if (self.private().active) return;
++        self.as(gtk.Widget).setVisible(0);
 +    }
 +
 +    fn animationValue(value: f64, ud: ?*anyopaque) callconv(.c) void {
@@ -914,6 +944,8 @@ index 0000000..18ed9b7
 +            class.bindTemplateChildPrivate("list_view", .{});
 +            class.bindTemplateChildPrivate("new_tab_button", .{});
 +            class.bindTemplateChildPrivate("new_tab_label", .{});
++            class.bindTemplateChildPrivate("overview_button", .{});
++            class.bindTemplateChildPrivate("menu_button", .{});
 +
 +            class.bindTemplateCallback("new_tab_clicked", &newTabClicked);
 +
@@ -1368,10 +1400,10 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..4e6ba92
+index 0000000..b131cf7
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,187 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1383,47 +1415,81 @@ index 0000000..4e6ba92
 +  Gtk.Box {
 +    orientation: vertical;
 +
-+    // Declared before the list and outside the ScrolledWindow, so it stays
-+    // pinned at the top while the tabs scroll beneath it.
-+    // Visibility is driven from Zig by `gtk-tabs-sidebar-new-button`.
-+    Gtk.Button new_tab_button {
-+      clicked => $new_tab_clicked();
-+      can-focus: false;
-+      focus-on-click: false;
++    // The top row: "New Tab" plus the two buttons Ghostty puts in its
++    // titlebar. Declared before the list and outside the ScrolledWindow, so
++    // the whole row stays pinned while the tabs scroll beneath it.
++    //
++    // Collapsed, only the "+" is shown and it occupies the whole rail. As the
++    // sidebar opens the other two fade in and the "+" gives up the width to
++    // make room, so the row grows into the space rather than rearranging.
++    Gtk.Box top_bar {
++      orientation: horizontal;
++      spacing: 0;
 +
-+      styles [
-+        "flat",
-+      ]
++      // Visibility is driven from Zig by `gtk-tabs-sidebar-new-button`.
++      Gtk.Button new_tab_button {
++        clicked => $new_tab_clicked();
++        can-focus: false;
++        focus-on-click: false;
++        hexpand: true;
 +
-+      // Deliberately a Box rather than Adw.ButtonContent: the label has to
-+      // fade out entirely in rail mode, and ButtonContent gives no way to
-+      // address its label on its own.
-+      // margin-start must match TabSidebar.icon_indent, and the image must
-+      // match icon_chip -- a comptime assert in tab_sidebar.zig fails the
-+      // build if rail_width changes and these are not updated. Sizing the
-+      // image to a fixed square is what keeps the "+" in the same column as
-+      // the tab glyphs, which have different natural widths.
-+      // No margin here: the button's own margins in CSS centre it in the
-+      // rail, and indenting again would push the icon out of the column and
-+      // the rail over the terminal. The fixed 32px square must match
-+      // TabSidebar.icon_chip -- symbolic icons differ in natural width, so
-+      // aligning on the box rather than the glyph is what keeps the "+" in
-+      // line with the tab icons.
-+      child: Gtk.Box {
-+        orientation: horizontal;
-+        spacing: 6;
-+        halign: start;
++        styles [
++          "flat",
++        ]
 +
-+        Gtk.Image {
-+          icon-name: "tab-new-symbolic";
-+          width-request: 32;
-+          height-request: 32;
-+        }
++        // Deliberately a Box rather than Adw.ButtonContent: the label has to
++        // fade out entirely in rail mode, and ButtonContent gives no way to
++        // address its label on its own.
++        //
++        // No margin here -- the button's own margins in CSS centre it in the
++        // rail. The fixed 32px square must match TabSidebar.icon_chip:
++        // symbolic icons differ in natural width, so aligning on the box
++        // rather than the glyph is what keeps the "+" in line with the tab
++        // icons below.
++        child: Gtk.Box {
++          orientation: horizontal;
++          spacing: 6;
++          halign: start;
 +
-+        Gtk.Label new_tab_label {
-+          label: _("New Tab");
-+        }
-+      };
++          Gtk.Image {
++            icon-name: "tab-new-symbolic";
++            width-request: 32;
++            height-request: 32;
++          }
++
++          Gtk.Label new_tab_label {
++            label: _("New Tab");
++          }
++        };
++      }
++
++      // Both drive window actions rather than property bindings: the header
++      // bar can bind straight to tab_overview because it lives in the
++      // window's own template, but the sidebar is a separate class and
++      // cannot see it, so the overview toggle goes through
++      // win.toggle-tab-overview.
++      Gtk.Button overview_button {
++        action-name: "win.toggle-tab-overview";
++        icon-name: "view-grid-symbolic";
++        tooltip-text: _("View Open Tabs");
++        can-focus: false;
++        focus-on-click: false;
++
++        styles [
++          "flat",
++        ]
++      }
++
++      Gtk.MenuButton menu_button {
++        icon-name: "open-menu-symbolic";
++        menu-model: sidebar_menu;
++        tooltip-text: _("Main Menu");
++        can-focus: false;
++
++        styles [
++          "flat",
++        ]
++      }
 +    }
 +
 +    // propagate-natural-width and overlay-scrolling both matter: without
@@ -1459,41 +1525,6 @@ index 0000000..4e6ba92
 +      }
 +    }
 +
-+    // Pinned below the list, mirroring the two buttons Ghostty puts in the
-+    // titlebar. Both drive window actions rather than property bindings: the
-+    // header bar can bind straight to tab_overview because it lives in the
-+    // window's own template, but the sidebar is a separate class and cannot
-+    // see it, so the overview toggle goes through win.toggle-tab-overview.
-+    Gtk.Box bottom_bar {
-+      orientation: horizontal;
-+      halign: center;
-+      spacing: 2;
-+      margin-top: 2;
-+      margin-bottom: 6;
-+
-+      Gtk.Button overview_button {
-+        action-name: "win.toggle-tab-overview";
-+        icon-name: "view-grid-symbolic";
-+        tooltip-text: _("View Open Tabs");
-+        can-focus: false;
-+        focus-on-click: false;
-+
-+        styles [
-+          "flat",
-+        ]
-+      }
-+
-+      Gtk.MenuButton menu_button {
-+        icon-name: "open-menu-symbolic";
-+        menu-model: sidebar_menu;
-+        tooltip-text: _("Main Menu");
-+        can-focus: false;
-+
-+        styles [
-+          "flat",
-+        ]
-+      }
-+    }
 +  }
 +}
 +
