@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..8835da8
+index 0000000..18ed9b7
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,903 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -255,7 +255,32 @@ index 0000000..8835da8
 +
 +        self.as(gtk.Widget).setVisible(0);
 +        self.applyCollapsed();
++    }
 +
++    fn dispose(self: *Self) callconv(.c) void {
++        const priv = self.private();
++
++        self.cancelHoverTimer();
++        for (priv.rows.items) |row| {
++            if (row.surface) |s| {
++                if (row.pwd_handler != 0) {
++                    gobject.signalHandlerDisconnect(s.as(gobject.Object), row.pwd_handler);
++                }
++            }
++        }
++        priv.rows.deinit(Application.default().allocator());
++
++        if (priv.config) |config| {
++            config.unref();
++            priv.config = null;
++        }
++        if (priv.tab_view) |tab_view| {
++            tab_view.unref();
++            priv.tab_view = null;
++        }
++
++        gtk.Widget.disposeTemplate(self.as(gtk.Widget), getGObjectType());
++        gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
 +    }
 +
 +    //---------------------------------------------------------------
