@@ -1,0 +1,7 @@
+# Build scratch. The upstream source, toolchain and dependency cache all live
+# outside this repo and are re-derivable; only the patches are irreplaceable.
+/build/
+/src/
+*.tar.gz
+*.tar.xz
+*.log

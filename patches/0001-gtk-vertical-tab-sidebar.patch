@@ -1,0 +1,1395 @@
+diff --git a/src/apprt/gtk/build/gresource.zig b/src/apprt/gtk/build/gresource.zig
+index bcece4c..ee9b6d5 100644
+--- a/src/apprt/gtk/build/gresource.zig
++++ b/src/apprt/gtk/build/gresource.zig
+@@ -51,6 +51,7 @@ pub const blueprints: []const Blueprint = &.{
+     .{ .major = 1, .minor = 5, .name = "surface-scrolled-window" },
+     .{ .major = 1, .minor = 3, .name = "surface-child-exited" },
+     .{ .major = 1, .minor = 5, .name = "tab" },
++    .{ .major = 1, .minor = 5, .name = "tab-sidebar" },
+     .{ .major = 1, .minor = 5, .name = "title-dialog" },
+     .{ .major = 1, .minor = 5, .name = "window" },
+     .{ .major = 1, .minor = 5, .name = "command-palette" },
+diff --git a/src/apprt/gtk/class.zig b/src/apprt/gtk/class.zig
+index 942666c..1fb158c 100644
+--- a/src/apprt/gtk/class.zig
++++ b/src/apprt/gtk/class.zig
+@@ -11,6 +11,7 @@ pub const Application = @import("class/application.zig").Application;
+ pub const Window = @import("class/window.zig").Window;
+ pub const Config = @import("class/config.zig").Config;
+ pub const Surface = @import("class/surface.zig").Surface;
++pub const TabSidebar = @import("class/tab_sidebar.zig").TabSidebar;
+ 
+ /// Common methods for all GObject classes we create.
+ pub fn Common(
+diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
+new file mode 100644
+index 0000000..36e026e
+--- /dev/null
++++ b/src/apprt/gtk/class/tab_sidebar.zig
+@@ -0,0 +1,847 @@
++const std = @import("std");
++
++const adw = @import("adw");
++const gdk = @import("gdk");
++const glib = @import("glib");
++const gobject = @import("gobject");
++const gtk = @import("gtk");
++
++const gresource = @import("../build/gresource.zig");
++const Common = @import("../class.zig").Common;
++const Application = @import("application.zig").Application;
++const Config = @import("config.zig").Config;
++const Surface = @import("surface.zig").Surface;
++const Tab = @import("tab.zig").Tab;
++
++const log = std.log.scoped(.gtk_ghostty_tab_sidebar);
++
++/// A vertical list of the tabs in an `AdwTabView`, used as the window sidebar
++/// when `gtk-tabs-location` is `left` or `right`.
++///
++/// This is only a *consumer* of the existing tab model. `adw_tab_view_get_pages`
++/// hands back a `GtkSelectionModel` that AdwTabView keeps up to date, and
++/// giving that straight to a `GtkListView` makes selection track in both
++/// directions: clicking a row selects the tab, and selecting the tab elsewhere
++/// highlights the row. Nothing here duplicates tab state.
++///
++/// The sidebar rests collapsed as a narrow icon rail. Putting the pointer on
++/// it expands it over the terminal; leaving, typing, or clicking the terminal
++/// collapses it again. The expansion is an overlay, so the terminal never
++/// reflows.
++pub const TabSidebar = extern struct {
++    const Self = @This();
++    parent_instance: Parent,
++    pub const Parent = adw.Bin;
++    pub const getGObjectType = gobject.ext.defineClass(Self, .{
++        .name = "GhosttyTabSidebar",
++        .instanceInit = &init,
++        .classInit = &Class.init,
++        .parent_class = &Class.parent,
++        .private = .{ .Type = Private, .offset = &Private.offset },
++    });
++
++    /// Width of the collapsed icon rail and of the expanded list.
++    pub const rail_width: c_int = 46;
++    const expanded_width: c_int = 260;
++
++    /// Expanding is instant on pointer enter. Collapsing waits, so that
++    /// briefly leaving the sidebar -- crossing a gap, overshooting a row --
++    /// doesn't snap it shut under you.
++    const hover_collapse_ms: c_uint = 400;
++
++    /// Duration of the expand/collapse width animation.
++    const animation_ms: c_uint = 180;
++
++    /// How many parent directories we're willing to prepend to a tab name
++    /// while trying to make it unique.
++    const max_name_depth: usize = 8;
++
++    /// A realized row. GtkListView recycles rows, so these come and go as the
++    /// user scrolls; we track them to restyle and rename in place.
++    const Row = struct {
++        page: *adw.TabPage,
++        box: *gtk.Box,
++        text_box: *gtk.Box,
++        label: *gtk.Label,
++        close: *gtk.Button,
++
++        /// The surface we're watching for directory changes, and the handler
++        /// watching it. Without this a tab keeps its old folder name forever
++        /// after you cd.
++        surface: ?*Surface = null,
++        pwd_handler: c_ulong = 0,
++    };
++
++    const key_row_box = "ghostty-row-box";
++    const key_title_label = "ghostty-title-label";
++    const key_text_box = "ghostty-text-box";
++    const key_icon_image = "ghostty-icon-image";
++    const key_close_button = "ghostty-close-button";
++    const key_page = "ghostty-page";
++
++    pub const properties = struct {
++        /// Read-only: whether the sidebar is currently the narrow rail. The
++        /// window watches this to fade its scrim in and out.
++        pub const collapsed = struct {
++            pub const name = "collapsed";
++            const impl = gobject.ext.defineProperty(
++                name,
++                Self,
++                bool,
++                .{
++                    .default = true,
++                    .accessor = gobject.ext.typedAccessor(Self, bool, .{
++                        .getter = Self.isCollapsed,
++                    }),
++                },
++            );
++        };
++
++        pub const config = struct {
++            pub const name = "config";
++            const impl = gobject.ext.defineProperty(
++                name,
++                Self,
++                ?*Config,
++                .{ .accessor = C.privateObjFieldAccessor("config") },
++            );
++        };
++
++        pub const @"tab-view" = struct {
++            pub const name = "tab-view";
++            const impl = gobject.ext.defineProperty(
++                name,
++                Self,
++                ?*adw.TabView,
++                .{ .accessor = C.privateObjFieldAccessor("tab_view") },
++            );
++        };
++    };
++
++    const Private = struct {
++        config: ?*Config = null,
++        tab_view: ?*adw.TabView = null,
++
++        /// True while the sidebar is a narrow icon rail.
++        collapsed: bool = true,
++
++        /// Whether the sidebar is wanted at all. False with a single tab, in
++        /// which case the width animates to zero rather than vanishing.
++        active: bool = false,
++
++        /// Whether the "New Tab" row is wanted. Pushed in by the window from
++        /// `gtk-tabs-sidebar-new-button` rather than read from our own
++        /// `config` property: Window.init assigns its private `config` field
++        /// directly without emitting notify, so a blueprint
++        /// `config: bind template.config` binding never propagates here.
++        new_button_enabled: bool = true,
++
++        /// Pending collapse timer, running while the pointer is away.
++        hover_timer: ?c_uint = null,
++
++        /// Width animation and the width it is currently showing.
++        animation: ?*adw.TimedAnimation = null,
++        current_width: f64 = 0,
++
++        /// The content widget whose margin reserves room for the rail, and
++        /// which side the sidebar is on.
++        content: ?*gtk.Widget = null,
++        on_right: bool = false,
++
++        /// Currently realized rows.
++        rows: std.ArrayListUnmanaged(Row) = .empty,
++
++        list_view: *gtk.ListView,
++        new_tab_button: *gtk.Button,
++        new_tab_label: *gtk.Label,
++
++        pub var offset: c_int = 0;
++    };
++
++    //---------------------------------------------------------------
++    // Virtual Methods
++
++    fn init(self: *Self, _: *Class) callconv(.c) void {
++        gtk.Widget.initTemplate(self.as(gtk.Widget));
++
++        const priv = self.private();
++
++        // Build the row factory. We use a signal factory rather than a
++        // builder one because each row needs a close button wired back to a
++        // specific page, which a declarative list item template can't express.
++        const factory = gtk.SignalListItemFactory.new();
++        _ = gtk.SignalListItemFactory.signals.setup.connect(factory, *Self, &rowSetup, self, .{});
++        _ = gtk.SignalListItemFactory.signals.bind.connect(factory, *Self, &rowBind, self, .{});
++        _ = gtk.SignalListItemFactory.signals.unbind.connect(factory, *Self, &rowUnbind, self, .{});
++        priv.list_view.setFactory(factory.as(gtk.ListItemFactory));
++
++        // Width animation. The target writes straight into our size request.
++        const target = adw.CallbackAnimationTarget.new(&animationValue, self, null);
++        priv.animation = adw.TimedAnimation.new(
++            self.as(gtk.Widget),
++            0,
++            0,
++            animation_ms,
++            target.as(adw.AnimationTarget),
++        );
++
++        // Entering expands instantly; leaving collapses after a delay.
++        const motion = gtk.EventControllerMotion.new();
++        _ = gtk.EventControllerMotion.signals.enter.connect(motion, *Self, &hoverEnter, self, .{});
++        _ = gtk.EventControllerMotion.signals.leave.connect(motion, *Self, &hoverLeave, self, .{});
++        self.as(gtk.Widget).addController(motion.as(gtk.EventController));
++
++        _ = gobject.Object.signals.notify.connect(
++            self,
++            ?*anyopaque,
++            propTabView,
++            null,
++            .{ .detail = "tab-view" },
++        );
++
++        self.as(gtk.Widget).setVisible(0);
++        self.applyCollapsed();
++    }
++
++    fn dispose(self: *Self) callconv(.c) void {
++        const priv = self.private();
++
++        self.cancelHoverTimer();
++        for (priv.rows.items) |row| {
++            if (row.surface) |s| {
++                if (row.pwd_handler != 0) {
++                    gobject.signalHandlerDisconnect(s.as(gobject.Object), row.pwd_handler);
++                }
++            }
++        }
++        priv.rows.deinit(Application.default().allocator());
++
++        if (priv.config) |config| {
++            config.unref();
++            priv.config = null;
++        }
++        if (priv.tab_view) |tab_view| {
++            tab_view.unref();
++            priv.tab_view = null;
++        }
++
++        gtk.Widget.disposeTemplate(self.as(gtk.Widget), getGObjectType());
++        gobject.Object.virtual_methods.dispose.call(Class.parent, self.as(Parent));
++    }
++
++    //---------------------------------------------------------------
++    // Collapse / Expand
++
++    pub fn isCollapsed(self: *Self) bool {
++        return self.private().collapsed;
++    }
++
++    /// Collapse the sidebar back to the icon rail. Called by the window when
++    /// the user types or clicks the terminal, and when the pointer leaves.
++    pub fn collapse(self: *Self) void {
++        self.cancelHoverTimer();
++        self.setCollapsed(true);
++    }
++
++    /// Whether the sidebar should exist at all. Driven by the window from tab
++    /// count; going inactive slides the rail out rather than snapping it
++    /// away, which is what makes closing your second-to-last tab animate.
++    pub fn setActive(self: *Self, active: bool) void {
++        const priv = self.private();
++        if (priv.active == active) return;
++        priv.active = active;
++
++        // Must be visible before it can animate in.
++        if (active) self.as(gtk.Widget).setVisible(1);
++
++        // Coming back always starts from the rail, never mid-expansion. This
++        // goes through setCollapsed rather than writing the field so that
++        // notify::collapsed still fires -- otherwise a sidebar that was open
++        // when the second-to-last tab closed would leave the window's scrim
++        // switched on with nothing to dim.
++        if (!active) {
++            self.cancelHoverTimer();
++            self.setCollapsed(true);
++        }
++        self.applyCollapsed();
++    }
++
++    /// The content widget we inset to make room for the rail.
++    pub fn setContentInset(self: *Self, content: *gtk.Widget, on_right: bool) void {
++        const priv = self.private();
++        priv.content = content;
++        priv.on_right = on_right;
++        self.applyInset(priv.current_width);
++    }
++
++    /// Set by the window from `gtk-tabs-sidebar-new-button`.
++    pub fn setNewButtonEnabled(self: *Self, enabled: bool) void {
++        const priv = self.private();
++        priv.new_button_enabled = enabled;
++        priv.new_tab_button.as(gtk.Widget).setVisible(@intFromBool(enabled));
++    }
++
++    fn setCollapsed(self: *Self, collapsed: bool) void {
++        const priv = self.private();
++        if (priv.collapsed == collapsed) return;
++        priv.collapsed = collapsed;
++        self.applyCollapsed();
++
++        self.as(gobject.Object).notifyByPspec(
++            properties.collapsed.impl.param_spec,
++        );
++    }
++
++    fn targetWidth(self: *Self) f64 {
++        const priv = self.private();
++        if (!priv.active) return 0;
++        return @floatFromInt(if (priv.collapsed) rail_width else expanded_width);
++    }
++
++    fn applyCollapsed(self: *Self) void {
++        const priv = self.private();
++        const collapsed = priv.collapsed;
++
++        self.animateWidth(self.targetWidth());
++        self.toggleCssClass("collapsed", collapsed);
++
++        // In rail mode only the icon is shown. The tooltip carries the name
++        // and path, so the row is still identifiable.
++        for (priv.rows.items) |row| {
++            row.text_box.as(gtk.Widget).setVisible(@intFromBool(!collapsed));
++            row.close.as(gtk.Widget).setVisible(@intFromBool(!collapsed));
++
++            // With the label gone the icon would sit against the left edge of
++            // the rail; center it so the rail reads as a column of buttons.
++            row.box.as(gtk.Widget).setHalign(if (collapsed) .center else .fill);
++        }
++
++        // In the rail there is no room for "New Tab", so drop to a bare icon.
++        priv.new_tab_label.as(gtk.Widget).setVisible(@intFromBool(!collapsed));
++        priv.new_tab_button.as(gtk.Widget).setVisible(
++            @intFromBool(priv.new_button_enabled),
++        );
++    }
++
++    /// Animate the sidebar width to `target`, starting from wherever the
++    /// current animation left off so that a reversal mid-slide is smooth
++    /// rather than jumping.
++    fn animateWidth(self: *Self, target: f64) void {
++        const priv = self.private();
++
++        const anim = priv.animation orelse {
++            priv.current_width = target;
++            self.as(gtk.Widget).setSizeRequest(@intFromFloat(target), -1);
++            self.applyInset(target);
++            return;
++        };
++
++        anim.as(adw.Animation).skip();
++        anim.setValueFrom(priv.current_width);
++        anim.setValueTo(target);
++        anim.as(adw.Animation).play();
++    }
++
++    fn animationValue(value: f64, ud: ?*anyopaque) callconv(.c) void {
++        const self: *Self = @ptrCast(@alignCast(ud orelse return));
++        const priv = self.private();
++        priv.current_width = value;
++        self.as(gtk.Widget).setSizeRequest(@intFromFloat(value), -1);
++        self.applyInset(value);
++
++        // setSizeRequest only sets a *minimum*; the rail's natural width
++        // would keep it on screen at the end of the slide-out. Hide it once
++        // the animation has actually reached zero.
++        if (!priv.active and value < 1) self.as(gtk.Widget).setVisible(0);
++    }
++
++    /// Inset the content by the *rail* width, never more. Expanding past the
++    /// rail overlays the terminal instead of pushing it, so the margin stays
++    /// put; sliding the rail out to zero takes the margin with it, so the
++    /// terminal reclaims the space in step with the animation.
++    fn applyInset(self: *Self, width: f64) void {
++        const priv = self.private();
++        const content = priv.content orelse return;
++
++        const rail: f64 = @floatFromInt(rail_width);
++        const inset: c_int = @intFromFloat(@min(width, rail));
++
++        content.setMarginStart(if (priv.on_right) 0 else inset);
++        content.setMarginEnd(if (priv.on_right) inset else 0);
++    }
++
++    fn toggleCssClass(self: *Self, name: [*:0]const u8, present: bool) void {
++        const widget = self.as(gtk.Widget);
++        if (present) {
++            widget.addCssClass(name);
++        } else {
++            widget.removeCssClass(name);
++        }
++    }
++
++    fn cancelHoverTimer(self: *Self) void {
++        const priv = self.private();
++        if (priv.hover_timer) |id| {
++            if (glib.Source.remove(id) == 0) {
++                log.warn("failed to remove hover timer id={}", .{id});
++            }
++            priv.hover_timer = null;
++        }
++    }
++
++    fn hoverEnter(
++        _: *gtk.EventControllerMotion,
++        _: f64,
++        _: f64,
++        self: *Self,
++    ) callconv(.c) void {
++        // Expanding is instant: any pending collapse is abandoned.
++        self.cancelHoverTimer();
++        if (self.private().active) self.setCollapsed(false);
++    }
++
++    fn hoverLeave(_: *gtk.EventControllerMotion, self: *Self) callconv(.c) void {
++        const priv = self.private();
++        if (priv.collapsed) return;
++
++        self.cancelHoverTimer();
++        priv.hover_timer = glib.timeoutAdd(hover_collapse_ms, hoverTimer, self);
++    }
++
++    fn hoverTimer(ud: ?*anyopaque) callconv(.c) c_int {
++        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
++        self.private().hover_timer = null;
++        self.setCollapsed(true);
++        return 0;
++    }
++
++    //---------------------------------------------------------------
++    // Properties
++
++    fn propTabView(self: *Self, _: *gobject.ParamSpec, _: ?*anyopaque) callconv(.c) void {
++        const priv = self.private();
++
++        const tab_view = priv.tab_view orelse {
++            priv.list_view.setModel(null);
++            return;
++        };
++
++        // The pages model is already a GtkSelectionModel maintained by
++        // AdwTabView, so handing it over is all the wiring selection needs.
++        // We own a reference from getPages and the list view takes its own.
++        const model = tab_view.getPages();
++        defer model.unref();
++        priv.list_view.setModel(model);
++    }
++
++    //---------------------------------------------------------------
++    // Naming
++    //
++    // A tab is labelled with just its folder name. When two tabs would show
++    // the same name we prepend parent directories to each, one level at a
++    // time, until they differ -- the way editors disambiguate same-named
++    // files. When the paths are genuinely identical (two shells in one
++    // directory) no amount of path helps, so we fall back to the terminal
++    // title, which with shell integration is usually the running command.
++
++    fn pageSurface(page: *adw.TabPage) ?*Surface {
++        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return null;
++        return tab.getActiveSurface();
++    }
++
++    fn pagePwd(page: *adw.TabPage) ?[:0]const u8 {
++        const surface = pageSurface(page) orelse return null;
++        return surface.getPwd();
++    }
++
++    fn pageTitle(page: *adw.TabPage) ?[:0]const u8 {
++        const surface = pageSurface(page) orelse return null;
++        return surface.getTitle();
++    }
++
++    /// The trailing `n` path components of `path`.
++    fn tailComponents(path: []const u8, n: usize) []const u8 {
++        var end = path.len;
++        while (end > 1 and path[end - 1] == '/') end -= 1;
++        if (end == 0) return path;
++
++        var seen: usize = 0;
++        var i = end;
++        while (i > 0) {
++            i -= 1;
++            if (path[i] == '/') {
++                seen += 1;
++                if (seen == n) return path[i + 1 .. end];
++            }
++        }
++        return path[0..end];
++    }
++
++    fn trimmedLen(path: []const u8) usize {
++        var end = path.len;
++        while (end > 1 and path[end - 1] == '/') end -= 1;
++        return end;
++    }
++
++    fn canGrow(path: []const u8, n: usize) bool {
++        return tailComponents(path, n).len < trimmedLen(path);
++    }
++
++    /// Recompute every realized row's label and tooltip.
++    fn refreshNames(self: *Self) void {
++        const priv = self.private();
++        const tab_view = priv.tab_view orelse return;
++        if (priv.rows.items.len == 0) return;
++
++        const n = tab_view.getNPages();
++        if (n <= 0) return;
++        const count: usize = @intCast(n);
++
++        const alloc = Application.default().allocator();
++        const paths = alloc.alloc(?[:0]const u8, count) catch return;
++        defer alloc.free(paths);
++        const depths = alloc.alloc(usize, count) catch return;
++        defer alloc.free(depths);
++
++        for (0..count) |i| {
++            paths[i] = pagePwd(tab_view.getNthPage(@intCast(i)));
++            depths[i] = 1;
++        }
++
++        // Grow colliding names until they differ or we run out of path.
++        var round: usize = 0;
++        while (round < max_name_depth) : (round += 1) {
++            var changed = false;
++            for (0..count) |i| {
++                const pi = paths[i] orelse continue;
++                for (i + 1..count) |j| {
++                    const pj = paths[j] orelse continue;
++                    // Identical paths can never be told apart by path.
++                    if (std.mem.eql(u8, pi, pj)) continue;
++                    if (!std.mem.eql(
++                        u8,
++                        tailComponents(pi, depths[i]),
++                        tailComponents(pj, depths[j]),
++                    )) continue;
++
++                    if (canGrow(pi, depths[i])) {
++                        depths[i] += 1;
++                        changed = true;
++                    }
++                    if (canGrow(pj, depths[j])) {
++                        depths[j] += 1;
++                        changed = true;
++                    }
++                }
++            }
++            if (!changed) break;
++        }
++
++        for (priv.rows.items) |row| {
++            const idx = pageIndex(tab_view, row.page) orelse continue;
++            const path = paths[idx];
++
++            // Does another tab share this exact path? Then disambiguate with
++            // the terminal title instead.
++            var duplicate_path = false;
++            if (path) |p| {
++                for (0..count) |k| {
++                    if (k == idx) continue;
++                    const other = paths[k] orelse continue;
++                    if (std.mem.eql(u8, p, other)) {
++                        duplicate_path = true;
++                        break;
++                    }
++                }
++            }
++
++            applyRowName(row, path, depths[idx], duplicate_path);
++        }
++    }
++
++    fn applyRowName(
++        row: Row,
++        path: ?[:0]const u8,
++        depth: usize,
++        duplicate_path: bool,
++    ) void {
++        const alloc = Application.default().allocator();
++
++        const p = path orelse {
++            // No working directory known; fall back to the page title.
++            const t = row.page.getTitle();
++            row.label.setText(t);
++            row.box.as(gtk.Widget).setTooltipText(t);
++            return;
++        };
++
++        const short = tailComponents(p, depth);
++
++        const label_text: [:0]const u8 = if (duplicate_path) blk: {
++            const title = pageTitle(row.page) orelse
++                break :blk alloc.dupeZ(u8, short) catch return;
++            break :blk std.fmt.allocPrintSentinel(
++                alloc,
++                "{s} — {s}",
++                .{ short, title },
++                0,
++            ) catch return;
++        } else alloc.dupeZ(u8, short) catch return;
++        defer alloc.free(label_text);
++
++        row.label.setText(label_text);
++
++        // The tooltip always carries the full path, so a grown or truncated
++        // name never hides where the tab actually is.
++        row.box.as(gtk.Widget).setTooltipText(p);
++    }
++
++    fn pageIndex(tab_view: *adw.TabView, page: *adw.TabPage) ?usize {
++        const n = tab_view.getNPages();
++        var i: c_int = 0;
++        while (i < n) : (i += 1) {
++            if (tab_view.getNthPage(i) == page) return @intCast(i);
++        }
++        return null;
++    }
++
++    //---------------------------------------------------------------
++    // Row Factory
++
++    fn rowSetup(
++        _: *gtk.SignalListItemFactory,
++        object: *gobject.Object,
++        self: *Self,
++    ) callconv(.c) void {
++        const list_item = gobject.ext.cast(gtk.ListItem, object) orelse return;
++
++        const box = gtk.Box.new(.horizontal, 6);
++        box.as(gtk.Widget).setMarginStart(4);
++        box.as(gtk.Widget).setMarginEnd(4);
++
++        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
++        box.append(icon.as(gtk.Widget));
++
++        // The title sits in a vertical box with room for a second line. That
++        // slot is unused today; it's where per-tab git branch would go
++        // without having to relayout the row.
++        const text_box = gtk.Box.new(.vertical, 0);
++        text_box.as(gtk.Widget).setHexpand(1);
++        const title = gtk.Label.new(null);
++        title.setXalign(0);
++        title.setEllipsize(.end);
++        title.setSingleLineMode(1);
++        text_box.append(title.as(gtk.Widget));
++        box.append(text_box.as(gtk.Widget));
++
++        const close = gtk.Button.newFromIconName("window-close-symbolic");
++        close.as(gtk.Widget).addCssClass("flat");
++        close.as(gtk.Widget).addCssClass("circular");
++        close.as(gtk.Widget).setFocusOnClick(0);
++        _ = gtk.Button.signals.clicked.connect(close, *Self, &rowCloseClicked, self, .{});
++        box.append(close.as(gtk.Widget));
++
++        // Middle click closes the tab, as it does in a browser tab strip.
++        // This works in rail mode too, where the close button is hidden.
++        const middle = gtk.GestureClick.new();
++        middle.as(gtk.GestureSingle).setButton(gdk.BUTTON_MIDDLE);
++        _ = gtk.GestureClick.signals.pressed.connect(
++            middle,
++            *Self,
++            &rowMiddleClick,
++            self,
++            .{},
++        );
++        box.as(gtk.Widget).addController(middle.as(gtk.EventController));
++
++        const obj = list_item.as(gobject.Object);
++        gobject.Object.setData(obj, key_row_box, box);
++        gobject.Object.setData(obj, key_title_label, title);
++        gobject.Object.setData(obj, key_text_box, text_box);
++        gobject.Object.setData(obj, key_icon_image, icon);
++        gobject.Object.setData(obj, key_close_button, close);
++
++        list_item.setChild(box.as(gtk.Widget));
++    }
++
++    fn rowBind(
++        _: *gtk.SignalListItemFactory,
++        object: *gobject.Object,
++        self: *Self,
++    ) callconv(.c) void {
++        const list_item = gobject.ext.cast(gtk.ListItem, object) orelse return;
++        const obj = list_item.as(gobject.Object);
++
++        const item = list_item.getItem() orelse return;
++        const page = gobject.ext.cast(adw.TabPage, item) orelse return;
++
++        const box: *gtk.Box = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_row_box) orelse return,
++        ));
++        const label: *gtk.Label = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_title_label) orelse return,
++        ));
++        const text_box: *gtk.Box = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_text_box) orelse return,
++        ));
++        const close: *gtk.Button = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_close_button) orelse return,
++        ));
++
++        gobject.Object.setData(close.as(gobject.Object), key_page, page);
++        gobject.Object.setData(box.as(gobject.Object), key_page, page);
++
++        // Watch this tab's directory so the label follows a cd.
++        var surface: ?*Surface = null;
++        var pwd_handler: c_ulong = 0;
++        if (pageSurface(page)) |s| {
++            surface = s;
++            pwd_handler = gobject.Object.signals.notify.connect(
++                s,
++                *Self,
++                &surfacePwdChanged,
++                self,
++                .{ .detail = "pwd" },
++            );
++        }
++
++        const priv = self.private();
++        priv.rows.append(Application.default().allocator(), .{
++            .page = page,
++            .box = box,
++            .text_box = text_box,
++            .label = label,
++            .close = close,
++            .surface = surface,
++            .pwd_handler = pwd_handler,
++        }) catch return;
++
++        // Match whatever collapse state we're currently in.
++        text_box.as(gtk.Widget).setVisible(@intFromBool(!priv.collapsed));
++        close.as(gtk.Widget).setVisible(@intFromBool(!priv.collapsed));
++        box.as(gtk.Widget).setHalign(if (priv.collapsed) .center else .fill);
++
++        self.refreshNames();
++    }
++
++    fn rowUnbind(
++        _: *gtk.SignalListItemFactory,
++        object: *gobject.Object,
++        self: *Self,
++    ) callconv(.c) void {
++        const list_item = gobject.ext.cast(gtk.ListItem, object) orelse return;
++        const obj = list_item.as(gobject.Object);
++
++        const box = gobject.Object.getData(obj, key_row_box) orelse return;
++        const priv = self.private();
++        for (priv.rows.items, 0..) |row, i| {
++            if (@intFromPtr(row.box) == @intFromPtr(box)) {
++                if (row.surface) |s| {
++                    if (row.pwd_handler != 0) {
++                        gobject.signalHandlerDisconnect(
++                            s.as(gobject.Object),
++                            row.pwd_handler,
++                        );
++                    }
++                }
++                _ = priv.rows.swapRemove(i);
++                break;
++            }
++        }
++
++        // Drop the page pointers so a recycled row can never act on the tab
++        // it used to be showing.
++        if (gobject.Object.getData(obj, key_close_button)) |ptr| {
++            const c: *gtk.Button = @ptrCast(@alignCast(ptr));
++            gobject.Object.setData(c.as(gobject.Object), key_page, null);
++        }
++        if (gobject.Object.getData(obj, key_row_box)) |ptr| {
++            const b: *gtk.Box = @ptrCast(@alignCast(ptr));
++            gobject.Object.setData(b.as(gobject.Object), key_page, null);
++        }
++    }
++
++    //---------------------------------------------------------------
++    // Signal Handlers
++
++    fn surfacePwdChanged(
++        _: *Surface,
++        _: *gobject.ParamSpec,
++        self: *Self,
++    ) callconv(.c) void {
++        // One tab's cd can change another tab's label, by creating or
++        // resolving a name collision, so recompute all of them.
++        self.refreshNames();
++    }
++
++    fn closePageData(self: *Self, obj: *gobject.Object) void {
++        const tab_view = self.private().tab_view orelse return;
++        const ptr = gobject.Object.getData(obj, key_page) orelse return;
++        const page: *adw.TabPage = @ptrCast(@alignCast(ptr));
++
++        // Go through closePage so close confirmation and the window's
++        // existing close-page handler still run.
++        tab_view.closePage(page);
++    }
++
++    fn rowCloseClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
++        self.closePageData(button.as(gobject.Object));
++    }
++
++    fn rowMiddleClick(
++        gesture: *gtk.GestureClick,
++        _: c_int,
++        _: f64,
++        _: f64,
++        self: *Self,
++    ) callconv(.c) void {
++        const widget = gesture.as(gtk.EventController).getWidget() orelse return;
++        self.closePageData(widget.as(gobject.Object));
++    }
++
++    fn newTabClicked(_: *gtk.Button, self: *Self) callconv(.c) void {
++        _ = gtk.Widget.activateAction(self.as(gtk.Widget), "win.new-tab", null);
++    }
++
++    const C = Common(Self, Private);
++    pub const as = C.as;
++    pub const ref = C.ref;
++    pub const refSink = C.refSink;
++    pub const unref = C.unref;
++    const private = C.private;
++
++    pub const Class = extern struct {
++        parent_class: Parent.Class,
++        var parent: *Parent.Class = undefined;
++        pub const Instance = Self;
++
++        fn init(class: *Class) callconv(.c) void {
++            gtk.Widget.Class.setTemplateFromResource(
++                class.as(gtk.Widget.Class),
++                comptime gresource.blueprint(.{
++                    .major = 1,
++                    .minor = 5,
++                    .name = "tab-sidebar",
++                }),
++            );
++
++            class.bindTemplateChildPrivate("list_view", .{});
++            class.bindTemplateChildPrivate("new_tab_button", .{});
++            class.bindTemplateChildPrivate("new_tab_label", .{});
++
++            class.bindTemplateCallback("new_tab_clicked", &newTabClicked);
++
++            gobject.ext.registerProperties(class, &.{
++                properties.collapsed.impl,
++                properties.config.impl,
++                properties.@"tab-view".impl,
++            });
++
++            gobject.Object.virtual_methods.dispose.implement(class, &dispose);
++        }
++
++        pub const as = C.Class.as;
++        pub const bindTemplateChildPrivate = C.Class.bindTemplateChildPrivate;
++        pub const bindTemplateCallback = C.Class.bindTemplateCallback;
++    };
++};
+diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
+index c01cad6..30bc500 100644
+--- a/src/apprt/gtk/class/window.zig
++++ b/src/apprt/gtk/class/window.zig
+@@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
+ const Tab = @import("tab.zig").Tab;
+ const DebugWarning = @import("debug_warning.zig").DebugWarning;
+ const CommandPalette = @import("command_palette.zig").CommandPalette;
++const TabSidebar = @import("tab_sidebar.zig").TabSidebar;
+ const WeakRef = @import("../weak_ref.zig").WeakRef;
+ 
+ const log = std.log.scoped(.gtk_ghostty_window);
+@@ -195,6 +196,21 @@ pub const Window = extern struct {
+             );
+         };
+ 
++        pub const @"sidebar-visible" = struct {
++            pub const name = "sidebar-visible";
++            const impl = gobject.ext.defineProperty(
++                name,
++                Self,
++                bool,
++                .{
++                    .default = false,
++                    .accessor = gobject.ext.typedAccessor(Self, bool, .{
++                        .getter = Self.getSidebarVisible,
++                    }),
++                },
++            );
++        };
++
+         pub const @"toolbar-style" = struct {
+             pub const name = "toolbar-style";
+             const impl = gobject.ext.defineProperty(
+@@ -262,6 +278,9 @@ pub const Window = extern struct {
+         tab_view: *adw.TabView,
+         toolbar: *adw.ToolbarView,
+         toast_overlay: *adw.ToastOverlay,
++        content_box: *gtk.Box,
++        dim_overlay: *gtk.Box,
++        tab_sidebar: *TabSidebar,
+ 
+         pub var offset: c_int = 0;
+     };
+@@ -304,6 +323,48 @@ pub const Window = extern struct {
+             break :config config.get();
+         };
+ 
++        // Clicking anywhere in the terminal area dismisses the sidebar and
++        // hands the keyboard straight back, with no wait for the hover
++        // timeout. Capture phase so it runs before the surface consumes the
++        // click, and it never claims the event.
++        const content_click = gtk.GestureClick.new();
++        content_click.as(gtk.GestureSingle).setButton(0);
++        content_click.as(gtk.EventController).setPropagationPhase(.capture);
++        _ = gtk.GestureClick.signals.pressed.connect(
++            content_click,
++            *Self,
++            &contentClicked,
++            self,
++            .{},
++        );
++        priv.content_box.as(gtk.Widget).addController(
++            content_click.as(gtk.EventController),
++        );
++
++        // Fade the scrim over the terminal whenever the sidebar expands or
++        // collapses.
++        _ = gobject.Object.signals.notify.connect(
++            priv.tab_sidebar,
++            *Self,
++            &sidebarCollapsed,
++            self,
++            .{ .detail = "collapsed" },
++        );
++
++        // Typing collapses the tab sidebar back to its rail so it never sits
++        // over the terminal while you're working. This runs in the capture
++        // phase and never claims the event, so key handling is unaffected.
++        const keys = gtk.EventControllerKey.new();
++        keys.as(gtk.EventController).setPropagationPhase(.capture);
++        _ = gtk.EventControllerKey.signals.key_pressed.connect(
++            keys,
++            *Self,
++            windowKeyPressed,
++            self,
++            .{},
++        );
++        self.as(gtk.Widget).addController(keys.as(gtk.EventController));
++
+         // We initialize our windowing protocol to none because we can't
+         // actually initialize this until we get realized.
+         priv.winproto = .none;
+@@ -664,6 +725,7 @@ pub const Window = extern struct {
+         // Trigger all our dynamic properties that depend on the config.
+         inline for (&.{
+             "headerbar-visible",
++            "sidebar-visible",
+             "tabs-autohide",
+             "tabs-visible",
+             "tabs-wide",
+@@ -693,13 +755,18 @@ pub const Window = extern struct {
+                 config.@"window-theme" == .ghostty,
+         );
+ 
+-        // Move the tab bar to the proper location.
++        // Move the tab bar to the proper location. For the side locations the
++        // tab bar isn't used at all; the sidebar renders the tabs instead and
++        // `tabs-visible` keeps the bar hidden. We still re-add it so that
++        // switching back to top/bottom at runtime works.
+         priv.toolbar.remove(priv.tab_bar.as(gtk.Widget));
+         switch (config.@"gtk-tabs-location") {
+-            .top => priv.toolbar.addTopBar(priv.tab_bar.as(gtk.Widget)),
++            .top, .left, .right => priv.toolbar.addTopBar(priv.tab_bar.as(gtk.Widget)),
+             .bottom => priv.toolbar.addBottomBar(priv.tab_bar.as(gtk.Widget)),
+         }
+ 
++        self.syncSidebarLayout();
++
+         // Do our window-protocol specific appearance sync.
+         priv.winproto.syncAppearance() catch |err| {
+             log.warn("failed to sync winproto appearance error={}", .{err});
+@@ -1011,10 +1078,43 @@ pub const Window = extern struct {
+         };
+     }
+ 
++    /// The vertical tab sidebar is shown only when tabs are located on a side
++    /// and there is more than one tab. With a single tab the sidebar would
++    /// just be a one-row list, so we hide it and give the space back to the
++    /// terminal.
++    fn getSidebarVisible(self: *Self) bool {
++        const priv = self.private();
++        const config = if (priv.config) |v| v.get() else return false;
++        return switch (config.@"gtk-tabs-location") {
++            .left, .right => priv.tab_view.getNPages() > 1,
++            .top, .bottom => false,
++        };
++    }
++
++    /// Place the sidebar on the configured side. The sidebar itself owns the
++    /// content inset from here, so its width and the terminal's margin move
++    /// together during the slide.
++    fn syncSidebarLayout(self: *Self) void {
++        const priv = self.private();
++        const config = if (priv.config) |v| v.get() else return;
++
++        const on_right = config.@"gtk-tabs-location" == .right;
++        priv.tab_sidebar.as(gtk.Widget).setHalign(if (on_right) .end else .start);
++        priv.tab_sidebar.setNewButtonEnabled(config.@"gtk-tabs-sidebar-new-button");
++        priv.tab_sidebar.setContentInset(priv.content_box.as(gtk.Widget), on_right);
++        priv.tab_sidebar.setActive(self.getSidebarVisible());
++    }
++
+     fn getTabsVisible(self: *Self) bool {
+         const priv = self.private();
+         const config = if (priv.config) |v| v.get() else return true;
+ 
++        // The horizontal tab bar is never shown when tabs live in the sidebar.
++        switch (config.@"gtk-tabs-location") {
++            .left, .right => return false,
++            .top, .bottom => {},
++        }
++
+         switch (config.@"gtk-titlebar-style") {
+             .tabs => {
+                 // *Conditionally* disable the tab bar when maximized, the titlebar
+@@ -1579,12 +1679,62 @@ pub const Window = extern struct {
+         priv.tab_view.closePage(page);
+     }
+ 
++    fn contentClicked(
++        _: *gtk.GestureClick,
++        _: c_int,
++        _: f64,
++        _: f64,
++        self: *Self,
++    ) callconv(.c) void {
++        self.private().tab_sidebar.collapse();
++        if (self.getActiveSurface()) |surface| surface.grabFocus();
++    }
++
++    fn sidebarCollapsed(
++        sidebar: *TabSidebar,
++        _: *gobject.ParamSpec,
++        self: *Self,
++    ) callconv(.c) void {
++        const dim = self.private().dim_overlay.as(gtk.Widget);
++        if (sidebar.isCollapsed()) {
++            dim.removeCssClass("active");
++
++            // Hand the keyboard straight back to the terminal so you can type
++            // the moment the sidebar is out of the way.
++            if (self.getActiveSurface()) |surface| surface.grabFocus();
++        } else {
++            dim.addCssClass("active");
++        }
++    }
++
++    fn windowKeyPressed(
++        _: *gtk.EventControllerKey,
++        _: c_uint,
++        _: c_uint,
++        _: gdk.ModifierType,
++        self: *Self,
++    ) callconv(.c) c_int {
++        self.private().tab_sidebar.collapse();
++
++        // Never handle the key; we only observe it.
++        return 0;
++    }
++
+     fn tabViewNPages(
+         _: *adw.TabView,
+         _: *gobject.ParamSpec,
+         self: *Self,
+     ) callconv(.c) void {
+         const priv = self.private();
++
++        // The sidebar hides itself when only one tab is left, so its
++        // visibility and the content inset both have to be recomputed
++        // whenever the count changes.
++        self.as(gobject.Object).notifyByPspec(
++            properties.@"sidebar-visible".impl.param_spec,
++        );
++        self.syncSidebarLayout();
++
+         if (priv.tab_view.getNPages() == 0) {
+             // If we have no pages left then we want to close window.
+ 
+@@ -2061,6 +2211,7 @@ pub const Window = extern struct {
+             gobject.ext.ensureType(SplitTree);
+             gobject.ext.ensureType(Surface);
+             gobject.ext.ensureType(Tab);
++            gobject.ext.ensureType(TabSidebar);
+             gtk.Widget.Class.setTemplateFromResource(
+                 class.as(gtk.Widget.Class),
+                 comptime gresource.blueprint(.{
+@@ -2078,6 +2229,7 @@ pub const Window = extern struct {
+                 properties.@"headerbar-visible".impl,
+                 properties.@"quick-terminal".impl,
+                 properties.@"tabs-autohide".impl,
++                properties.@"sidebar-visible".impl,
+                 properties.@"tabs-visible".impl,
+                 properties.@"tabs-wide".impl,
+                 properties.@"toolbar-style".impl,
+@@ -2090,6 +2242,9 @@ pub const Window = extern struct {
+             class.bindTemplateChildPrivate("tab_view", .{});
+             class.bindTemplateChildPrivate("toolbar", .{});
+             class.bindTemplateChildPrivate("toast_overlay", .{});
++            class.bindTemplateChildPrivate("content_box", .{});
++            class.bindTemplateChildPrivate("dim_overlay", .{});
++            class.bindTemplateChildPrivate("tab_sidebar", .{});
+ 
+             // Template Callbacks
+             class.bindTemplateCallback("realize", &windowRealize);
+diff --git a/src/apprt/gtk/css/style-dark.css b/src/apprt/gtk/css/style-dark.css
+index f13b4f4..d7466de 100644
+--- a/src/apprt/gtk/css/style-dark.css
++++ b/src/apprt/gtk/css/style-dark.css
+@@ -6,3 +6,11 @@
+   background-color: rgba(36, 36, 36, 1);
+   background-clip: content-box;
+ }
++
++/* Dark fallback for GTK below 4.16, where the CSS variable in style.css is
++ * dropped. The variable is repeated after it so that on 4.16+ the system
++ * theme still wins over this literal. */
++.ghostty-tab-sidebar {
++  background-color: #2e2e32;
++  background-color: var(--sidebar-bg-color);
++}
+diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
+index 9c0f115..df71521 100644
+--- a/src/apprt/gtk/css/style.css
++++ b/src/apprt/gtk/css/style.css
+@@ -181,3 +181,51 @@ label.resize-overlay {
+   margin: 0;
+   padding: 0;
+ }
++
++/*
++ * GhosttyTabSidebar
++ *
++ * The sidebar is an Adw.Bin sitting in a GtkOverlay above the terminal, and a
++ * plain Bin draws no background of its own. Without an explicit one the tab
++ * rows render straight over terminal output as soon as the sidebar expands.
++ *
++ * Each color is declared twice on purpose. libadwaita's `@define-color` names
++ * live in its own style provider and are NOT visible from ours, so
++ * `@sidebar_bg_color` parses as invalid here and the declaration is dropped
++ * entirely -- leaving the sidebar with no background at all. Its CSS
++ * *variables* do cross providers, but only on GTK 4.16 and later. So: a
++ * literal first, which always parses, then the variable, which overrides it
++ * wherever it is supported.
++ */
++.ghostty-tab-sidebar {
++  background-color: #ebebed;
++  background-color: var(--sidebar-bg-color);
++  color: var(--sidebar-fg-color);
++}
++
++.ghostty-tab-sidebar list {
++  background-color: transparent;
++}
++
++/* Lift the expanded sidebar off the terminal it is covering. */
++.ghostty-tab-sidebar:not(.collapsed) {
++  box-shadow: 0 0 12px 0 rgba(0, 0, 0, 0.25);
++  box-shadow: 0 0 12px 0 var(--sidebar-shade-color);
++}
++
++/*
++ * Scrim covering the terminal while the sidebar is expanded, from the
++ * sidebar's inner edge to the far side of the window. It is a sibling overlay
++ * drawn *under* the sidebar, so the sidebar's own area stays undimmed.
++ *
++ * can-target=false in the blueprint keeps it from swallowing clicks meant for
++ * the terminal underneath.
++ */
++.ghostty-tab-sidebar-dim {
++  background-color: transparent;
++  transition: background-color 180ms ease;
++}
++
++.ghostty-tab-sidebar-dim.active {
++  background-color: rgba(0, 0, 0, 0.35);
++}
+diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
+new file mode 100644
+index 0000000..89b1393
+--- /dev/null
++++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
+@@ -0,0 +1,67 @@
++using Gtk 4.0;
++using Adw 1;
++
++template $GhosttyTabSidebar: Adw.Bin {
++  styles [
++    "ghostty-tab-sidebar",
++  ]
++
++  Gtk.Box {
++    orientation: vertical;
++
++    Gtk.ScrolledWindow {
++      vexpand: true;
++      hscrollbar-policy: never;
++
++      // The model and factory are both installed from Zig. The model is the
++      // GtkSelectionModel that AdwTabView already maintains for its pages, so
++      // selection stays in sync with the tab view in both directions without
++      // any bookkeeping on our side.
++      //
++      // Not focusable on purpose: keyboard focus must stay in the terminal
++      // when you click a tab, the same way Ghostty's toolbar buttons set
++      // can-focus=false. Otherwise clicking the sidebar leaves you typing
++      // into a list instead of the shell.
++      //
++      // single-click-activate is deliberately left off: GTK documents it as
++      // "activate rows on single click and select them on hover", and the
++      // hover half of that would switch tabs just by moving the pointer.
++      Gtk.ListView list_view {
++        focusable: false;
++
++        styles [
++          "navigation-sidebar",
++        ]
++      }
++    }
++
++    // Visibility is driven from Zig by `gtk-tabs-sidebar-new-button`.
++    Gtk.Button new_tab_button {
++      clicked => $new_tab_clicked();
++      can-focus: false;
++      focus-on-click: false;
++
++      styles [
++        "flat",
++      ]
++
++      // Deliberately a Box rather than Adw.ButtonContent: the label has to
++      // disappear entirely in rail mode, and ButtonContent gives no way to
++      // hide just its label -- clearing the text leaves the button blank
++      // instead of falling back to the icon.
++      child: Gtk.Box {
++        orientation: horizontal;
++        spacing: 6;
++        halign: center;
++
++        Gtk.Image {
++          icon-name: "tab-new-symbolic";
++        }
++
++        Gtk.Label new_tab_label {
++          label: _("New Tab");
++        }
++      };
++    }
++  }
++}
+diff --git a/src/apprt/gtk/ui/1.5/window.blp b/src/apprt/gtk/ui/1.5/window.blp
+index b66a930..cc77400 100644
+--- a/src/apprt/gtk/ui/1.5/window.blp
++++ b/src/apprt/gtk/ui/1.5/window.blp
+@@ -147,25 +147,55 @@ template $GhosttyWindow: Adw.ApplicationWindow {
+         }
+       }
+ 
+-      Box {
+-        orientation: vertical;
++      // The sidebar is an overlay rather than a split view pane on purpose.
++      // AdwOverlaySplitView can either give the sidebar its own column or
++      // overlay it entirely; it can't keep a narrow rail in the layout while
++      // letting the expanded list float above the terminal. With an overlay
++      // we reserve the rail width as a margin on the content and let the
++      // sidebar grow over the top, so expanding never reflows the terminal.
++      Gtk.Overlay {
++        Box content_box {
++          orientation: vertical;
+ 
+-        $GhosttyDebugWarning {
+-          visible: bind template.debug;
++          $GhosttyDebugWarning {
++            visible: bind template.debug;
++          }
++
++          Adw.ToastOverlay toast_overlay {
++            Adw.TabView tab_view {
++              notify::n-pages => $notify_n_pages();
++              notify::selected-page => $notify_selected_page();
++              close-page => $close_page();
++              page-attached => $page_attached();
++              page-detached => $page_detached();
++              create-window => $tab_create_window();
++              setup-menu => $setup_tab_menu();
++              menu-model: tab_context_menu;
++              shortcuts: none;
++            }
++          }
+         }
+ 
+-        Adw.ToastOverlay toast_overlay {
+-          Adw.TabView tab_view {
+-            notify::n-pages => $notify_n_pages();
+-            notify::selected-page => $notify_selected_page();
+-            close-page => $close_page();
+-            page-attached => $page_attached();
+-            page-detached => $page_detached();
+-            create-window => $tab_create_window();
+-            setup-menu => $setup_tab_menu();
+-            menu-model: tab_context_menu;
+-            shortcuts: none;
+-          }
++        // Declared before the sidebar so it is drawn underneath it: the scrim
++        // covers the whole overlay, and the opaque sidebar then paints over
++        // its own strip, leaving only the terminal dimmed.
++        [overlay]
++        Gtk.Box dim_overlay {
++          can-target: false;
++
++          styles [
++            "ghostty-tab-sidebar-dim",
++          ]
++        }
++
++        // Visibility is not bound here: it is animated from Zig so that
++        // dropping to a single tab slides the rail out instead of making it
++        // disappear between frames.
++        [overlay]
++        $GhosttyTabSidebar tab_sidebar {
++          config: bind template.config;
++          tab-view: tab_view;
++          valign: fill;
+         }
+       }
+     }
+diff --git a/src/config/Config.zig b/src/config/Config.zig
+index 278ffd7..71565b8 100644
+--- a/src/config/Config.zig
++++ b/src/config/Config.zig
+@@ -3572,7 +3572,13 @@ else
+ @"gtk-titlebar": bool = true,
+ 
+ /// Determines the side of the screen that the GTK tab bar will stick to.
+-/// Top, bottom, and hidden are supported. The default is top.
++/// Top, bottom, left, and right are supported. The default is top.
++///
++/// When `left` or `right` is set, tabs are listed vertically in a sidebar on
++/// that side instead of horizontally in a tab bar. This keeps many tabs
++/// readable at once, which the horizontal bar cannot do past a handful of
++/// tabs. The sidebar rests as a narrow icon rail, expands over the terminal
++/// while the pointer is on it, and hides entirely when only one tab is open.
+ ///
+ /// When `hidden` is set, a tab button displaying the number of tabs will appear
+ /// in the title bar. It has the ability to open a tab overview for displaying
+@@ -3581,6 +3587,13 @@ else
+ /// with keybinds.
+ @"gtk-tabs-location": GtkTabsLocation = .top,
+ 
++/// If `true`, show a "New Tab" button at the bottom of the vertical tab
++/// sidebar. Only has an effect when `gtk-tabs-location` is `left` or `right`.
++///
++/// Set this to `false` if you prefer a sidebar that contains nothing but the
++/// tab list and create tabs from a keybind instead.
++@"gtk-tabs-sidebar-new-button": bool = true,
++
+ /// If this is `true`, the titlebar will be hidden when the window is maximized,
+ /// and shown when the titlebar is unmaximized. GTK only.
+ ///
+@@ -8985,6 +8998,8 @@ pub const GtkSingleInstance = enum {
+ pub const GtkTabsLocation = enum {
+     top,
+     bottom,
++    left,
++    right,
+ };
+ 
+ /// See gtk-toolbar-style
