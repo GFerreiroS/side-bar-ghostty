@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..559a14a
+index 0000000..18ed9b7
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,903 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -95,14 +95,14 @@ index 0000000..559a14a
 +    /// nominal 16px drifts visibly between the "+" and the tab glyphs.
 +    const icon_chip: c_int = 32;
 +
-+    /// The indent that centers that square within the rail. tab-sidebar.blp
-+    /// hardcodes it because blueprint cannot reference a Zig constant, so it
-+    /// is asserted here: change rail_width and the build fails rather than
-+    /// silently knocking the "+" out of line.
-+    const icon_indent: c_int = @divTrunc(rail_width - icon_chip, 2);
++    // Centering is done entirely by the row/button margins in CSS, which are
++    // (rail_width - icon_chip) / 2 on each side. Nothing indents the icon a
++    // second time: doing that made the content need 39px inside a 32px chip,
++    // which both misaligned the "+" and pushed the rail wider than
++    // rail_width, so it overlapped the terminal.
 +    comptime {
-+        if (icon_indent != 7) @compileError(
-+            "margin-start in tab-sidebar.blp must be updated to match icon_indent",
++        if (@rem(rail_width - icon_chip, 2) != 0) @compileError(
++            "rail_width - icon_chip must be even so the icon centers exactly",
 +        );
 +    }
 +
@@ -700,13 +700,10 @@ index 0000000..559a14a
 +    ) callconv(.c) void {
 +        const list_item = gobject.ext.cast(gtk.ListItem, object) orelse return;
 +
++        // No margins on the row box at all. The chip's own margins centre it
++        // in the rail; anything here would be added on top of that and push
++        // the content wider than the rail.
 +        const box = gtk.Box.new(.horizontal, 6);
-+
-+        // Indent so the icon square lands in the middle of the rail. Fixed
-+        // rather than switched between centered and left-aligned, so the icon
-+        // holds still while the sidebar slides around it.
-+        box.as(gtk.Widget).setMarginStart(icon_indent);
-+        box.as(gtk.Widget).setMarginEnd(4);
 +
 +        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
 +        icon.as(gtk.Widget).setSizeRequest(icon_chip, icon_chip);
@@ -1223,10 +1220,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..07cfa70 100644
+index 9c0f115..ff3fb43 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,114 @@ label.resize-overlay {
+@@ -181,3 +181,116 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1278,7 +1275,8 @@ index 9c0f115..07cfa70 100644
 + * same axis as the icon's own indent, so nothing shifts between states.
 + */
 +.ghostty-tab-sidebar listview > row {
-+  margin: 1px 6px;
++  padding: 0;
++  margin: 1px 7px;
 +  border-radius: 8px;
 +  min-height: 0;
 +}
@@ -1290,16 +1288,17 @@ index 9c0f115..07cfa70 100644
 +}
 +
 +/* Same treatment for the pinned "New Tab" button, so it sits in the column
-+ * rather than floating above it. */
++ * rather than floating above it. The 7px side margins are the only thing
++ * centering either one: 46 - 32 = 14, split evenly. Nothing else may add an
++ * indent, or the content exceeds the rail and pushes it over the terminal. */
 +.ghostty-tab-sidebar button.flat {
 +  padding: 0;
-+  margin: 6px 6px 2px;
++  margin: 6px 7px 2px;
 +  border-radius: 8px;
 +  min-height: 32px;
 +}
 +
 +.ghostty-tab-sidebar.collapsed button.flat {
-+  margin: 6px 7px 2px;
 +  border-radius: 10px;
 +}
 +
@@ -1343,10 +1342,10 @@ index 9c0f115..07cfa70 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..764925e
+index 0000000..98d8dc9
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,89 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1378,11 +1377,16 @@ index 0000000..764925e
 +      // build if rail_width changes and these are not updated. Sizing the
 +      // image to a fixed square is what keeps the "+" in the same column as
 +      // the tab glyphs, which have different natural widths.
++      // No margin here: the button's own margins in CSS centre it in the
++      // rail, and indenting again would push the icon out of the column and
++      // the rail over the terminal. The fixed 32px square must match
++      // TabSidebar.icon_chip -- symbolic icons differ in natural width, so
++      // aligning on the box rather than the glyph is what keeps the "+" in
++      // line with the tab icons.
 +      child: Gtk.Box {
 +        orientation: horizontal;
 +        spacing: 6;
 +        halign: start;
-+        margin-start: 7;
 +
 +        Gtk.Image {
 +          icon-name: "tab-new-symbolic";
@@ -1396,9 +1400,16 @@ index 0000000..764925e
 +      };
 +    }
 +
++    // propagate-natural-width and overlay-scrolling both matter: without
++    // them the vertical scrollbar reserves layout width once there are
++    // enough tabs to scroll, making the rail wider than rail_width while the
++    // terminal's inset stays put -- so the rail creeps over the terminal.
 +    Gtk.ScrolledWindow {
 +      vexpand: true;
 +      hscrollbar-policy: never;
++      propagate-natural-width: false;
++      overlay-scrolling: true;
++      min-content-width: 0;
 +
 +      // The model and factory are both installed from Zig. The model is the
 +      // GtkSelectionModel that AdwTabView already maintains for its pages, so
