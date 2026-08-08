@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..b10c366
+index 0000000..aa31e83
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,902 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -88,18 +88,21 @@ index 0000000..b10c366
 +    /// snapping out from under you.
 +    const label_fade_start: f64 = 0.35;
 +
-+    /// Nominal width of a row icon, used to center it within the rail.
-+    const icon_width: c_int = 16;
++    /// Every icon sits in a fixed square of this size, in rows and in the
++    /// "New Tab" button alike. Aligning on a fixed box rather than on the
++    /// icon's own width is what keeps them in a column: symbolic icons do not
++    /// all report the same natural width, so margin arithmetic against a
++    /// nominal 16px drifts visibly between the "+" and the tab glyphs.
++    const icon_chip: c_int = 32;
 +
-+    /// The indent that lines an icon up with the middle of the rail. The
-+    /// "New Tab" button hardcodes this in tab-sidebar.blp because blueprint
-+    /// cannot reference a Zig constant, so it is asserted here: change
-+    /// rail_width and this fails the build rather than silently drifting the
-+    /// "+" out of line with the tab icons below it.
-+    const new_tab_indent: c_int = @divTrunc(rail_width - icon_width, 2);
++    /// The indent that centers that square within the rail. tab-sidebar.blp
++    /// hardcodes it because blueprint cannot reference a Zig constant, so it
++    /// is asserted here: change rail_width and the build fails rather than
++    /// silently knocking the "+" out of line.
++    const icon_indent: c_int = @divTrunc(rail_width - icon_chip, 2);
 +    comptime {
-+        if (new_tab_indent != 15) @compileError(
-+            "margin-start in tab-sidebar.blp must be updated to match",
++        if (icon_indent != 7) @compileError(
++            "margin-start in tab-sidebar.blp must be updated to match icon_indent",
 +        );
 +    }
 +
@@ -695,13 +698,14 @@ index 0000000..b10c366
 +
 +        const box = gtk.Box.new(.horizontal, 6);
 +
-+        // Indent so the icon lands in the middle of the rail. Fixed rather
-+        // than switched between centered and left-aligned, so the icon holds
-+        // still while the sidebar slides around it.
-+        box.as(gtk.Widget).setMarginStart(@divTrunc(rail_width - icon_width, 2));
++        // Indent so the icon square lands in the middle of the rail. Fixed
++        // rather than switched between centered and left-aligned, so the icon
++        // holds still while the sidebar slides around it.
++        box.as(gtk.Widget).setMarginStart(icon_indent);
 +        box.as(gtk.Widget).setMarginEnd(4);
 +
 +        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
++        icon.as(gtk.Widget).setSizeRequest(icon_chip, icon_chip);
 +        box.append(icon.as(gtk.Widget));
 +
 +        // The title sits in a vertical box with room for a second line. That
@@ -927,7 +931,7 @@ index 0000000..b10c366
 +    };
 +};
 diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
-index c01cad6..30bc500 100644
+index c01cad6..757c87a 100644
 --- a/src/apprt/gtk/class/window.zig
 +++ b/src/apprt/gtk/class/window.zig
 @@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
@@ -1092,10 +1096,27 @@ index c01cad6..30bc500 100644
          switch (config.@"gtk-titlebar-style") {
              .tabs => {
                  // *Conditionally* disable the tab bar when maximized, the titlebar
-@@ -1579,12 +1679,62 @@ pub const Window = extern struct {
+@@ -1488,6 +1588,9 @@ pub const Window = extern struct {
+         _: c_int,
+         self: *Self,
+     ) callconv(.c) void {
++        // A new tab must never leave the sidebar hanging open over it.
++        self.collapseSidebarForNewTab();
++
+         // Get the attached page which must be a Tab object.
+         const child = page.getChild();
+         const tab = gobject.ext.cast(Tab, child) orelse return;
+@@ -1579,12 +1682,69 @@ pub const Window = extern struct {
          priv.tab_view.closePage(page);
      }
  
++    /// A tab appearing must never pull the sidebar open. Creating a tab from
++    /// the sidebar's own "+" leaves the pointer sitting on the sidebar, which
++    /// would otherwise hold it expanded over the terminal you just asked for.
++    fn collapseSidebarForNewTab(self: *Self) void {
++        self.private().tab_sidebar.collapse();
++    }
++
 +    fn contentClicked(
 +        _: *gtk.GestureClick,
 +        _: c_int,
@@ -1155,7 +1176,7 @@ index c01cad6..30bc500 100644
          if (priv.tab_view.getNPages() == 0) {
              // If we have no pages left then we want to close window.
  
-@@ -2061,6 +2211,7 @@ pub const Window = extern struct {
+@@ -2061,6 +2221,7 @@ pub const Window = extern struct {
              gobject.ext.ensureType(SplitTree);
              gobject.ext.ensureType(Surface);
              gobject.ext.ensureType(Tab);
@@ -1163,7 +1184,7 @@ index c01cad6..30bc500 100644
              gtk.Widget.Class.setTemplateFromResource(
                  class.as(gtk.Widget.Class),
                  comptime gresource.blueprint(.{
-@@ -2078,6 +2229,7 @@ pub const Window = extern struct {
+@@ -2078,6 +2239,7 @@ pub const Window = extern struct {
                  properties.@"headerbar-visible".impl,
                  properties.@"quick-terminal".impl,
                  properties.@"tabs-autohide".impl,
@@ -1171,7 +1192,7 @@ index c01cad6..30bc500 100644
                  properties.@"tabs-visible".impl,
                  properties.@"tabs-wide".impl,
                  properties.@"toolbar-style".impl,
-@@ -2090,6 +2242,9 @@ pub const Window = extern struct {
+@@ -2090,6 +2252,9 @@ pub const Window = extern struct {
              class.bindTemplateChildPrivate("tab_view", .{});
              class.bindTemplateChildPrivate("toolbar", .{});
              class.bindTemplateChildPrivate("toast_overlay", .{});
@@ -1296,10 +1317,10 @@ index 9c0f115..a3b1802 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..46bb5a2
+index 0000000..764925e
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,77 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1326,17 +1347,21 @@ index 0000000..46bb5a2
 +      // Deliberately a Box rather than Adw.ButtonContent: the label has to
 +      // fade out entirely in rail mode, and ButtonContent gives no way to
 +      // address its label on its own.
-+      // margin-start must match the indent rows compute in Zig from
-+      // rail_width, or the "+" drifts out of line with the tab icons.
-+      // See TabSidebar.new_tab_indent, which is asserted against it.
++      // margin-start must match TabSidebar.icon_indent, and the image must
++      // match icon_chip -- a comptime assert in tab_sidebar.zig fails the
++      // build if rail_width changes and these are not updated. Sizing the
++      // image to a fixed square is what keeps the "+" in the same column as
++      // the tab glyphs, which have different natural widths.
 +      child: Gtk.Box {
 +        orientation: horizontal;
 +        spacing: 6;
 +        halign: start;
-+        margin-start: 15;
++        margin-start: 7;
 +
 +        Gtk.Image {
 +          icon-name: "tab-new-symbolic";
++          width-request: 32;
++          height-request: 32;
 +        }
 +
 +        Gtk.Label new_tab_label {
