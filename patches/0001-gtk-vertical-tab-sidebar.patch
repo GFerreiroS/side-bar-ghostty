@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..bd85e7e
+index 0000000..b10c366
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,898 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -90,6 +90,18 @@ index 0000000..bd85e7e
 +
 +    /// Nominal width of a row icon, used to center it within the rail.
 +    const icon_width: c_int = 16;
++
++    /// The indent that lines an icon up with the middle of the rail. The
++    /// "New Tab" button hardcodes this in tab-sidebar.blp because blueprint
++    /// cannot reference a Zig constant, so it is asserted here: change
++    /// rail_width and this fails the build rather than silently drifting the
++    /// "+" out of line with the tab icons below it.
++    const new_tab_indent: c_int = @divTrunc(rail_width - icon_width, 2);
++    comptime {
++        if (new_tab_indent != 15) @compileError(
++            "margin-start in tab-sidebar.blp must be updated to match",
++        );
++    }
 +
 +    /// How many parent directories we're willing to prepend to a tab name
 +    /// while trying to make it unique.
@@ -1186,10 +1198,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..6abc736 100644
+index 9c0f115..a3b1802 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,57 @@ label.resize-overlay {
+@@ -181,3 +181,92 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1224,6 +1236,41 @@ index 9c0f115..6abc736 100644
 +  background-color: transparent;
 +}
 +
++/*
++ * Rows. Expanded these are ordinary full-width list rows; collapsed they
++ * become centered square chips. Without this the row keeps its full expanded
++ * width and the rail simply clips it, so every tab reads as a slab running
++ * off the edge instead of a button.
++ *
++ * 7px side margins on a 46px rail leave a 32px chip whose center lands on the
++ * same axis as the icon's own indent, so nothing shifts between states.
++ */
++.ghostty-tab-sidebar listview > row {
++  margin: 1px 6px;
++  border-radius: 8px;
++  min-height: 0;
++}
++
++.ghostty-tab-sidebar.collapsed listview > row {
++  margin: 2px 7px;
++  min-height: 32px;
++  border-radius: 10px;
++}
++
++/* Same treatment for the pinned "New Tab" button, so it sits in the column
++ * rather than floating above it. */
++.ghostty-tab-sidebar button.flat {
++  padding: 0;
++  margin: 6px 6px 2px;
++  border-radius: 8px;
++  min-height: 32px;
++}
++
++.ghostty-tab-sidebar.collapsed button.flat {
++  margin: 6px 7px 2px;
++  border-radius: 10px;
++}
++
 +/* Lift the expanded sidebar off the terminal it is covering. */
 +.ghostty-tab-sidebar:not(.collapsed) {
 +  border-radius: 10px;
@@ -1249,10 +1296,10 @@ index 9c0f115..6abc736 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..3a6dcc5
+index 0000000..46bb5a2
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,73 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1279,11 +1326,14 @@ index 0000000..3a6dcc5
 +      // Deliberately a Box rather than Adw.ButtonContent: the label has to
 +      // fade out entirely in rail mode, and ButtonContent gives no way to
 +      // address its label on its own.
++      // margin-start must match the indent rows compute in Zig from
++      // rail_width, or the "+" drifts out of line with the tab icons.
++      // See TabSidebar.new_tab_indent, which is asserted against it.
 +      child: Gtk.Box {
 +        orientation: horizontal;
 +        spacing: 6;
 +        halign: start;
-+        margin-start: 11;
++        margin-start: 15;
 +
 +        Gtk.Image {
 +          icon-name: "tab-new-symbolic";
