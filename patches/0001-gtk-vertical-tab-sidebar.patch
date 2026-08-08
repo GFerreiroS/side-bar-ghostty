@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..eae8554
+index 0000000..3a6af9d
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,989 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -202,6 +202,13 @@ index 0000000..eae8554
 +        content: ?*gtk.Widget = null,
 +        on_right: bool = false,
 +
++        /// Last values pushed to the terminal's margin and to the labels.
++        /// The animation runs at frame rate, and re-applying these every
++        /// frame relaid out the terminal and re-mapped every label sixty
++        /// times a second, which is what made the slide stutter.
++        last_inset: c_int = -1,
++        last_labels_shown: bool = false,
++
 +        /// Currently realized rows.
 +        rows: std.ArrayListUnmanaged(Row) = .empty,
 +
@@ -265,6 +272,14 @@ index 0000000..eae8554
 +            propTabView,
 +            null,
 +            .{ .detail = "tab-view" },
++        );
++
++        _ = gobject.Object.signals.notify.connect(
++            priv.menu_button,
++            *Self,
++            &menuActive,
++            self,
++            .{ .detail = "active" },
 +        );
 +
 +        self.as(gtk.Widget).setVisible(0);
@@ -404,30 +419,40 @@ index 0000000..eae8554
 +    fn applyLabelFade(self: *Self, width: f64) void {
 +        const priv = self.private();
 +        const opacity = labelOpacity(width);
-+        const shown: c_int = @intFromBool(opacity > 0.01);
++
++        // Visibility triggers a relayout, so only touch it when it actually
++        // flips. Opacity alone is a cheap redraw.
++        const shown = opacity > 0.01;
++        const flipped = shown != priv.last_labels_shown;
++        priv.last_labels_shown = shown;
++        const vis: c_int = @intFromBool(shown);
 +
 +        for (priv.rows.items) |row| {
 +            const text = row.text_box.as(gtk.Widget);
 +            const close = row.close.as(gtk.Widget);
 +            text.setOpacity(opacity);
 +            close.setOpacity(opacity);
-+            text.setVisible(shown);
-+            close.setVisible(shown);
++            if (flipped) {
++                text.setVisible(vis);
++                close.setVisible(vis);
++            }
 +        }
 +
 +        const label = priv.new_tab_label.as(gtk.Widget);
 +        label.setOpacity(opacity);
-+        label.setVisible(shown);
 +
 +        // The overview and menu buttons live in the same row as "New Tab".
 +        // They only exist once there is room for them, and the "+" gives up
 +        // its width to make space rather than the row rearranging.
-+        for ([_]*gtk.Widget{
-+            priv.overview_button.as(gtk.Widget),
-+            priv.menu_button.as(gtk.Widget),
-+        }) |w| {
-+            w.setOpacity(opacity);
-+            w.setVisible(shown);
++        const overview = priv.overview_button.as(gtk.Widget);
++        const menu = priv.menu_button.as(gtk.Widget);
++        overview.setOpacity(opacity);
++        menu.setOpacity(opacity);
++
++        if (flipped) {
++            label.setVisible(vis);
++            overview.setVisible(vis);
++            menu.setVisible(vis);
 +        }
 +    }
 +
@@ -481,6 +506,12 @@ index 0000000..eae8554
 +        const rail: f64 = @floatFromInt(rail_width);
 +        const inset: c_int = @intFromFloat(@min(width, rail));
 +
++        // Expanding past the rail never changes the inset, so most frames of
++        // a slide have nothing to do here. Skipping them keeps the terminal
++        // from being relaid out on every frame.
++        if (inset == priv.last_inset) return;
++        priv.last_inset = inset;
++
 +        content.setMarginStart(if (priv.on_right) 0 else inset);
 +        content.setMarginEnd(if (priv.on_right) inset else 0);
 +    }
@@ -516,11 +547,34 @@ index 0000000..eae8554
 +    }
 +
 +    fn hoverLeave(_: *gtk.EventControllerMotion, self: *Self) callconv(.c) void {
++        self.armCollapse();
++    }
++
++    /// Start the collapse countdown, unless the menu is open. Opening the
++    /// menu moves the pointer onto its popover, which reads as leaving the
++    /// sidebar -- collapsing it out from under the menu you just opened.
++    fn armCollapse(self: *Self) void {
 +        const priv = self.private();
 +        if (priv.collapsed) return;
++        if (priv.menu_button.getActive() != 0) return;
 +
 +        self.cancelHoverTimer();
 +        priv.hover_timer = glib.timeoutAdd(hover_collapse_ms, hoverTimer, self);
++    }
++
++    fn menuActive(
++        menu: *gtk.MenuButton,
++        _: *gobject.ParamSpec,
++        self: *Self,
++    ) callconv(.c) void {
++        if (menu.getActive() != 0) {
++            // Menu opening: hold the sidebar open for as long as it is up.
++            self.cancelHoverTimer();
++            return;
++        }
++
++        // Menu dismissed: resume the normal countdown.
++        self.armCollapse();
 +    }
 +
 +    fn hoverTimer(ud: ?*anyopaque) callconv(.c) c_int {
@@ -1400,10 +1454,10 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..b131cf7
+index 0000000..9a2eb90
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,192 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1446,10 +1500,15 @@ index 0000000..b131cf7
 +        // symbolic icons differ in natural width, so aligning on the box
 +        // rather than the glyph is what keeps the "+" in line with the tab
 +        // icons below.
++        // margin-start: 8 is measured, not derived. The button spans the full
++        // sidebar width while GtkListView insets its rows by 8px, so without
++        // this the "+" sits 8px left of every tab icon. If rail_width or the
++        // row margins change, re-measure rather than recompute.
 +        child: Gtk.Box {
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
++          margin-start: 8;
 +
 +          Gtk.Image {
 +            icon-name: "tab-new-symbolic";
