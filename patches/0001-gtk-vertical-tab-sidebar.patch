@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..3a6af9d
+index 0000000..2ee7551
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,1002 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -87,6 +87,12 @@ index 0000000..3a6af9d
 +    /// finished closing, so collapsing reads as a slide rather than the text
 +    /// snapping out from under you.
 +    const label_fade_start: f64 = 0.35;
++
++    /// Breathing room between the rail and the terminal. The rail reserves
++    /// its own width plus this, so terminal text never butts up against the
++    /// sidebar's edge -- the two occupy strictly separate space rather than
++    /// merely not overlapping.
++    const content_gap: f64 = 8;
 +
 +    /// Every icon sits in a fixed square of this size, in rows and in the
 +    /// "New Tab" button alike. Aligning on a fixed box rather than on the
@@ -504,7 +510,14 @@ index 0000000..3a6af9d
 +        const content = priv.content orelse return;
 +
 +        const rail: f64 = @floatFromInt(rail_width);
-+        const inset: c_int = @intFromFloat(@min(width, rail));
++        const reserved = @min(width, rail);
++
++        // The gap fades in with the rail rather than being added flat, so
++        // sliding out to nothing does not leave an 8px ledge behind at the
++        // last frame.
++        const inset: c_int = @intFromFloat(
++            reserved + (reserved / rail) * content_gap,
++        );
 +
 +        // Expanding past the rail never changes the inset, so most frames of
 +        // a slide have nothing to do here. Skipping them keeps the terminal
@@ -1454,7 +1467,7 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..9a2eb90
+index 0000000..f06f653
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 @@ -0,0 +1,192 @@
@@ -1500,15 +1513,15 @@ index 0000000..9a2eb90
 +        // symbolic icons differ in natural width, so aligning on the box
 +        // rather than the glyph is what keeps the "+" in line with the tab
 +        // icons below.
-+        // margin-start: 8 is measured, not derived. The button spans the full
-+        // sidebar width while GtkListView insets its rows by 8px, so without
-+        // this the "+" sits 8px left of every tab icon. If rail_width or the
-+        // row margins change, re-measure rather than recompute.
++        // margin-start is measured, not derived. The button spans the full
++        // sidebar width while GtkListView insets its rows, so without this
++        // the "+" sits left of every tab icon. If rail_width or the row
++        // margins change, re-measure rather than recompute.
 +        child: Gtk.Box {
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
-+          margin-start: 8;
++          margin-start: 5;
 +
 +          Gtk.Image {
 +            icon-name: "tab-new-symbolic";
