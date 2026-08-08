@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..aa31e83
+index 0000000..559a14a
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,902 @@
+@@ -0,0 +1,906 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -325,6 +325,10 @@ index 0000000..aa31e83
 +        const priv = self.private();
 +        priv.content = content;
 +        priv.on_right = on_right;
++
++        // The hairline goes on whichever edge faces the terminal.
++        self.toggleCssClass("sidebar-right", on_right);
++
 +        self.applyInset(priv.current_width);
 +    }
 +
@@ -1219,10 +1223,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..a3b1802 100644
+index 9c0f115..07cfa70 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,92 @@ label.resize-overlay {
+@@ -181,3 +181,114 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1247,10 +1251,17 @@ index 9c0f115..a3b1802 100644
 +  background-color: var(--sidebar-bg-color);
 +  color: var(--sidebar-fg-color);
 +
-+  /* Rounder as a rail, so it reads as a floating strip rather than a slab
-+   * welded to the window edge; squarer once expanded, where it is closer to
-+   * a panel. */
-+  border-radius: 14px;
++  /* Deliberately square and full height, separated from the terminal by a
++   * hairline on the facing edge. This is libadwaita's own sidebar convention
++   * -- its stylesheet draws sidebar edges with an inset box-shadow in
++   * --sidebar-border-color and never rounds a sidebar's outer corners.
++   * Rounding them made the rail read as a card floating on the terminal
++   * rather than part of the window. */
++  box-shadow: inset -1px 0 var(--sidebar-border-color);
++}
++
++.ghostty-tab-sidebar.sidebar-right {
++  box-shadow: inset 1px 0 var(--sidebar-border-color);
 +}
 +
 +.ghostty-tab-sidebar list {
@@ -1292,11 +1303,26 @@ index 9c0f115..a3b1802 100644
 +  border-radius: 10px;
 +}
 +
-+/* Lift the expanded sidebar off the terminal it is covering. */
++/* Expanded, the panel genuinely does float over the terminal, so it keeps the
++ * hairline and gains a shadow to say so. Collapsed it has neither. */
 +.ghostty-tab-sidebar:not(.collapsed) {
-+  border-radius: 10px;
-+  box-shadow: 0 0 12px 0 rgba(0, 0, 0, 0.25);
-+  box-shadow: 0 0 12px 0 var(--sidebar-shade-color);
++  box-shadow: inset -1px 0 var(--sidebar-border-color),
++              0 0 12px 0 var(--sidebar-shade-color);
++}
++
++.ghostty-tab-sidebar.sidebar-right:not(.collapsed) {
++  box-shadow: inset 1px 0 var(--sidebar-border-color),
++              0 0 12px 0 var(--sidebar-shade-color);
++}
++
++/* Selection: a filled rounded square behind the icon. alpha() rather than a
++ * literal so it tracks the foreground colour in both themes. */
++.ghostty-tab-sidebar listview > row:selected {
++  background-color: alpha(currentColor, 0.10);
++}
++
++.ghostty-tab-sidebar listview > row:hover {
++  background-color: alpha(currentColor, 0.05);
 +}
 +
 +/*
