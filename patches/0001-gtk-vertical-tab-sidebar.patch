@@ -932,7 +932,7 @@ index 0000000..18ed9b7
 +    };
 +};
 diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
-index c01cad6..757c87a 100644
+index c01cad6..6149dda 100644
 --- a/src/apprt/gtk/class/window.zig
 +++ b/src/apprt/gtk/class/window.zig
 @@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
@@ -1024,7 +1024,15 @@ index c01cad6..757c87a 100644
          // We initialize our windowing protocol to none because we can't
          // actually initialize this until we get realized.
          priv.winproto = .none;
-@@ -664,6 +725,7 @@ pub const Window = extern struct {
+@@ -373,6 +434,7 @@ pub const Window = extern struct {
+             .init("clear", actionClear, null),
+             // TODO: accept the surface that toggled the command palette
+             .init("toggle-command-palette", actionToggleCommandPalette, null),
++            .init("toggle-tab-overview", actionToggleTabOverview, null),
+             .init("toggle-inspector", actionToggleInspector, null),
+         };
+ 
+@@ -664,6 +726,7 @@ pub const Window = extern struct {
          // Trigger all our dynamic properties that depend on the config.
          inline for (&.{
              "headerbar-visible",
@@ -1032,7 +1040,7 @@ index c01cad6..757c87a 100644
              "tabs-autohide",
              "tabs-visible",
              "tabs-wide",
-@@ -693,13 +755,18 @@ pub const Window = extern struct {
+@@ -693,13 +756,18 @@ pub const Window = extern struct {
                  config.@"window-theme" == .ghostty,
          );
  
@@ -1053,7 +1061,7 @@ index c01cad6..757c87a 100644
          // Do our window-protocol specific appearance sync.
          priv.winproto.syncAppearance() catch |err| {
              log.warn("failed to sync winproto appearance error={}", .{err});
-@@ -1011,10 +1078,43 @@ pub const Window = extern struct {
+@@ -1011,10 +1079,43 @@ pub const Window = extern struct {
          };
      }
  
@@ -1097,7 +1105,7 @@ index c01cad6..757c87a 100644
          switch (config.@"gtk-titlebar-style") {
              .tabs => {
                  // *Conditionally* disable the tab bar when maximized, the titlebar
-@@ -1488,6 +1588,9 @@ pub const Window = extern struct {
+@@ -1488,6 +1589,9 @@ pub const Window = extern struct {
          _: c_int,
          self: *Self,
      ) callconv(.c) void {
@@ -1107,7 +1115,7 @@ index c01cad6..757c87a 100644
          // Get the attached page which must be a Tab object.
          const child = page.getChild();
          const tab = gobject.ext.cast(Tab, child) orelse return;
-@@ -1579,12 +1682,69 @@ pub const Window = extern struct {
+@@ -1579,12 +1683,69 @@ pub const Window = extern struct {
          priv.tab_view.closePage(page);
      }
  
@@ -1177,7 +1185,25 @@ index c01cad6..757c87a 100644
          if (priv.tab_view.getNPages() == 0) {
              // If we have no pages left then we want to close window.
  
-@@ -2061,6 +2221,7 @@ pub const Window = extern struct {
+@@ -1839,6 +2000,17 @@ pub const Window = extern struct {
+         self.performBindingAction(.new_window);
+     }
+ 
++    /// The header bar toggles the overview through a property binding, which
++    /// only works for widgets that can see `tab_overview` in the window's own
++    /// template. The sidebar is its own class, so it needs an action.
++    fn actionToggleTabOverview(
++        _: *gio.SimpleAction,
++        _: ?*glib.Variant,
++        self: *Window,
++    ) callconv(.c) void {
++        self.toggleTabOverview();
++    }
++
+     fn actionNewTab(
+         _: *gio.SimpleAction,
+         _: ?*glib.Variant,
+@@ -2061,6 +2233,7 @@ pub const Window = extern struct {
              gobject.ext.ensureType(SplitTree);
              gobject.ext.ensureType(Surface);
              gobject.ext.ensureType(Tab);
@@ -1185,7 +1211,7 @@ index c01cad6..757c87a 100644
              gtk.Widget.Class.setTemplateFromResource(
                  class.as(gtk.Widget.Class),
                  comptime gresource.blueprint(.{
-@@ -2078,6 +2239,7 @@ pub const Window = extern struct {
+@@ -2078,6 +2251,7 @@ pub const Window = extern struct {
                  properties.@"headerbar-visible".impl,
                  properties.@"quick-terminal".impl,
                  properties.@"tabs-autohide".impl,
@@ -1193,7 +1219,7 @@ index c01cad6..757c87a 100644
                  properties.@"tabs-visible".impl,
                  properties.@"tabs-wide".impl,
                  properties.@"toolbar-style".impl,
-@@ -2090,6 +2252,9 @@ pub const Window = extern struct {
+@@ -2090,6 +2264,9 @@ pub const Window = extern struct {
              class.bindTemplateChildPrivate("tab_view", .{});
              class.bindTemplateChildPrivate("toolbar", .{});
              class.bindTemplateChildPrivate("toast_overlay", .{});
@@ -1342,10 +1368,10 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..98d8dc9
+index 0000000..4e6ba92
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,188 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1433,6 +1459,105 @@ index 0000000..98d8dc9
 +      }
 +    }
 +
++    // Pinned below the list, mirroring the two buttons Ghostty puts in the
++    // titlebar. Both drive window actions rather than property bindings: the
++    // header bar can bind straight to tab_overview because it lives in the
++    // window's own template, but the sidebar is a separate class and cannot
++    // see it, so the overview toggle goes through win.toggle-tab-overview.
++    Gtk.Box bottom_bar {
++      orientation: horizontal;
++      halign: center;
++      spacing: 2;
++      margin-top: 2;
++      margin-bottom: 6;
++
++      Gtk.Button overview_button {
++        action-name: "win.toggle-tab-overview";
++        icon-name: "view-grid-symbolic";
++        tooltip-text: _("View Open Tabs");
++        can-focus: false;
++        focus-on-click: false;
++
++        styles [
++          "flat",
++        ]
++      }
++
++      Gtk.MenuButton menu_button {
++        icon-name: "open-menu-symbolic";
++        menu-model: sidebar_menu;
++        tooltip-text: _("Main Menu");
++        can-focus: false;
++
++        styles [
++          "flat",
++        ]
++      }
++    }
++  }
++}
++
++// The sidebar's own menu. Every entry targets an existing win.* or app.*
++// action, which resolve up the widget hierarchy to the window and
++// application, so nothing here reimplements behaviour.
++menu sidebar_menu {
++  section {
++    item {
++      label: _("New Tab");
++      action: "win.new-tab";
++    }
++
++    item {
++      label: _("Change Tab Title…");
++      action: "win.prompt-tab-title";
++    }
++
++    item {
++      label: _("Close Tab");
++      action: "win.close-tab";
++      target: "this";
++    }
++  }
++
++  section {
++    item {
++      label: _("View Open Tabs");
++      action: "win.toggle-tab-overview";
++    }
++
++    item {
++      label: _("Command Palette");
++      action: "win.toggle-command-palette";
++    }
++  }
++
++  // The sidebar's own settings -- width, animation timing, which side it
++  // sits on -- are config values, and Ghostty never writes its own config
++  // file, so the honest entry point is to open it.
++  section {
++    label: _("Sidebar");
++
++    item {
++      label: _("Open Configuration");
++      action: "app.open-config";
++    }
++
++    item {
++      label: _("Reload Configuration");
++      action: "app.reload-config";
++    }
++  }
++
++  section {
++    item {
++      label: _("New Window");
++      action: "win.new-window";
++    }
++
++    item {
++      label: _("About Ghostty");
++      action: "win.about";
++    }
 +  }
 +}
 diff --git a/src/apprt/gtk/ui/1.5/window.blp b/src/apprt/gtk/ui/1.5/window.blp
