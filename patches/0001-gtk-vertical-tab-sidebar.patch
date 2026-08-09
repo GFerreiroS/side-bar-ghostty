@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..5580fdf
+index 0000000..f44e341
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1079 @@
+@@ -0,0 +1,1187 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -36,8 +36,10 @@ index 0000000..5580fdf
 +const gobject = @import("gobject");
 +const gtk = @import("gtk");
 +
++const configpkg = @import("../../../config.zig");
 +const gresource = @import("../build/gresource.zig");
 +const Common = @import("../class.zig").Common;
++const Settings = @import("../tab_sidebar_settings.zig");
 +const Application = @import("application.zig").Application;
 +const Config = @import("config.zig").Config;
 +const Surface = @import("surface.zig").Surface;
@@ -70,28 +72,14 @@ index 0000000..5580fdf
 +        .private = .{ .Type = Private, .offset = &Private.offset },
 +    });
 +
-+    /// Width of the collapsed icon rail and of the expanded list.
-+    ///
-+    /// The rail is 46px of icon column plus 8px of breathing room before the
-+    /// terminal, and it owns both. The gap used to be a margin on the
-+    /// terminal instead, which left 8px of *window* background showing
-+    /// between the rail and the terminal -- and since the rail's edge
-+    /// hairline is drawn at the rail's own right edge, the line ended up
-+    /// floating 8px inside the visible band rather than marking where the
-+    /// terminal begins. Depending on the theme that read as a stray line or,
-+    /// where the window background is darker than the sidebar, as a black
-+    /// stripe. Owning the gap makes the band one uniform colour and puts the
-+    /// hairline exactly on the boundary.
-+    pub const rail_width: c_int = 54;
-+    const expanded_width: c_int = 260;
-+
-+    /// Expanding is instant on pointer enter. Collapsing waits, so that
-+    /// briefly leaving the sidebar -- crossing a gap, overshooting a row --
-+    /// doesn't snap it shut under you.
-+    const hover_collapse_ms: c_uint = 400;
-+
-+    /// Duration of the expand/collapse width animation.
-+    const animation_ms: c_uint = 320;
++    // Widths, timings and the icon chip size all live in `priv.settings` --
++    // see `tab_sidebar_settings.zig`. They were constants until they became
++    // configurable; the notes those constants carried are kept with the
++    // options in `Config.zig`, and with the geometry rules in
++    // `Settings.normalize`, which is where the old `comptime` assertion that
++    // the icon can be centred now lives.
++    //
++    // Two things stayed fixed, because neither is a matter of taste:
 +
 +    /// Fraction of the slide that passes before labels begin to appear. The
 +    /// same curve run backwards means they are gone well before the rail has
@@ -100,27 +88,9 @@ index 0000000..5580fdf
 +    const label_fade_start: f64 = 0.35;
 +
 +    /// Extra inset on the terminal beyond the rail's own width. Zero: the
-+    /// breathing room is inside `rail_width` now, painted in the sidebar's
++    /// breathing room is inside the rail width now, painted in the sidebar's
 +    /// own colour, so nothing shows through between the two.
 +    const content_gap: f64 = 0;
-+
-+    /// Every icon sits in a fixed square of this size, in rows and in the
-+    /// "New Tab" button alike. Aligning on a fixed box rather than on the
-+    /// icon's own width is what keeps them in a column: symbolic icons do not
-+    /// all report the same natural width, so margin arithmetic against a
-+    /// nominal 16px drifts visibly between the "+" and the tab glyphs.
-+    const icon_chip: c_int = 32;
-+
-+    // Centering is done entirely by the row/button margins in CSS, which are
-+    // (rail_width - icon_chip) / 2 on each side. Nothing indents the icon a
-+    // second time: doing that made the content need 39px inside a 32px chip,
-+    // which both misaligned the "+" and pushed the rail wider than
-+    // rail_width, so it overlapped the terminal.
-+    comptime {
-+        if (@rem(rail_width - icon_chip, 2) != 0) @compileError(
-+            "rail_width - icon_chip must be even so the icon centers exactly",
-+        );
-+    }
 +
 +    /// How many parent directories we're willing to prepend to a tab name
 +    /// while trying to make it unique.
@@ -133,6 +103,7 @@ index 0000000..5580fdf
 +        box: *gtk.Box,
 +        text_box: *gtk.Box,
 +        label: *gtk.Label,
++        icon: *gtk.Image,
 +        close: *gtk.Button,
 +
 +        /// The surface we're watching for directory changes, and the handler
@@ -192,19 +163,24 @@ index 0000000..5580fdf
 +        config: ?*Config = null,
 +        tab_view: ?*adw.TabView = null,
 +
++        /// Everything the sidebar's own look and feel is driven by. Starts at
++        /// the field defaults so the widget is usable before the window has
++        /// pushed anything in, then follows `gtk-tabs-sidebar-*` layered with
++        /// the sidebar's own `sidebar.conf`.
++        ///
++        /// The window pushes these in via `setSettings` rather than the
++        /// sidebar reading its own `config` property: `Window.init` assigns
++        /// its private `config` field directly without emitting notify, so a
++        /// blueprint `config: bind template.config` binding never propagates
++        /// here and the config would stay null forever.
++        settings: Settings = .{},
++
 +        /// True while the sidebar is a narrow icon rail.
 +        collapsed: bool = true,
 +
 +        /// Whether the sidebar is wanted at all. False with a single tab, in
 +        /// which case the width animates to zero rather than vanishing.
 +        active: bool = false,
-+
-+        /// Whether the "New Tab" row is wanted. Pushed in by the window from
-+        /// `gtk-tabs-sidebar-new-button` rather than read from our own
-+        /// `config` property: Window.init assigns its private `config` field
-+        /// directly without emitting notify, so a blueprint
-+        /// `config: bind template.config` binding never propagates here.
-+        new_button_enabled: bool = true,
 +
 +        /// Pending collapse timer, running while the pointer is away.
 +        hover_timer: ?c_uint = null,
@@ -234,7 +210,9 @@ index 0000000..5580fdf
 +        rows: std.ArrayListUnmanaged(Row) = .empty,
 +
 +        list_view: *gtk.ListView,
++        top_bar: *gtk.Box,
 +        new_tab_button: *gtk.Button,
++        new_tab_icon: *gtk.Image,
 +        new_tab_label: *gtk.Label,
 +        overview_button: *gtk.Button,
 +        menu_button: *gtk.MenuButton,
@@ -265,7 +243,7 @@ index 0000000..5580fdf
 +            self.as(gtk.Widget),
 +            0,
 +            0,
-+            animation_ms,
++            priv.settings.animation_duration,
 +            target.as(adw.AnimationTarget),
 +        );
 +
@@ -348,9 +326,23 @@ index 0000000..5580fdf
 +
 +    /// Collapse the sidebar back to the icon rail. Called by the window when
 +    /// the user types or clicks the terminal, and when the pointer leaves.
++    ///
++    /// In `expanded` mode there is nothing to collapse to: the panel is the
++    /// resting state, and typing must not make it flinch.
 +    pub fn collapse(self: *Self) void {
 +        self.cancelHoverTimer();
++        if (self.private().settings.mode == .expanded) return;
 +        self.setCollapsed(true);
++    }
++
++    /// The collapsed state the current mode rests in with nothing happening.
++    /// `hover` rests as the rail and only leaves it while the pointer is on
++    /// the sidebar; the other two never leave their resting state at all.
++    fn restingCollapsed(self: *Self) bool {
++        return switch (self.private().settings.mode) {
++            .hover, .rail => true,
++            .expanded => false,
++        };
 +    }
 +
 +    /// Whether the sidebar should exist at all. Driven by the window from tab
@@ -364,15 +356,14 @@ index 0000000..5580fdf
 +        // Must be visible before it can animate in.
 +        if (active) self.as(gtk.Widget).setVisible(1);
 +
-+        // Coming back always starts from the rail, never mid-expansion. This
-+        // goes through setCollapsed rather than writing the field so that
++        // Either direction returns to the mode's resting state, never to
++        // wherever a half-finished hover left things. This goes through
++        // setCollapsed rather than writing the field so that
 +        // notify::collapsed still fires -- otherwise a sidebar that was open
 +        // when the second-to-last tab closed would leave the window's scrim
 +        // switched on with nothing to dim.
-+        if (!active) {
-+            self.cancelHoverTimer();
-+            self.setCollapsed(true);
-+        }
++        self.cancelHoverTimer();
++        self.setCollapsed(self.restingCollapsed());
 +        self.applyCollapsed();
 +    }
 +
@@ -388,11 +379,49 @@ index 0000000..5580fdf
 +        self.applyInset(priv.current_width);
 +    }
 +
-+    /// Set by the window from `gtk-tabs-sidebar-new-button`.
-+    pub fn setNewButtonEnabled(self: *Self, enabled: bool) void {
++    /// The settings currently in force. The window reads `auto_hide` from
++    /// here so that "should the sidebar exist at all" answers to the same
++    /// layered value the sidebar itself uses, not to the raw config.
++    pub fn getSettings(self: *Self) *const Settings {
++        return &self.private().settings;
++    }
++
++    /// Adopt a new set of settings and redraw to match.
++    ///
++    /// Everything here has to be re-pushed rather than read on demand: the
++    /// animation duration lives on the `AdwTimedAnimation`, the widths reach
++    /// the widget through a size request, and the mode decides whether the
++    /// collapsed flag is ours to change at all. Called on config reload and,
++    /// later, from the preferences dialog.
++    pub fn setSettings(self: *Self, settings: Settings) void {
 +        const priv = self.private();
-+        priv.new_button_enabled = enabled;
-+        priv.new_tab_button.as(gtk.Widget).setVisible(@intFromBool(enabled));
++        priv.settings = settings;
++        priv.settings.normalize();
++
++        if (priv.animation) |anim| {
++            anim.setDuration(priv.settings.animation_duration);
++        }
++
++        // Land in the new mode's resting state. A countdown left over from
++        // the mode we are leaving would otherwise fire against the new one.
++        self.cancelHoverTimer();
++        self.setCollapsed(self.restingCollapsed());
++
++        // Every icon sits in a square of the same size, the "+" included --
++        // that shared box, not the glyphs, is what keeps them in one column.
++        // Rows are sized here as well as in `rowSetup`, because the ones
++        // already realized would otherwise keep the old size until recycled.
++        const chip: c_int = @intCast(priv.settings.icon_size);
++        priv.new_tab_icon.as(gtk.Widget).setSizeRequest(chip, chip);
++        for (priv.rows.items) |row| {
++            row.icon.as(gtk.Widget).setSizeRequest(chip, chip);
++        }
++
++        self.applyCollapsed();
++
++        // Tooltips differ between modes, so they are rebuilt rather than left
++        // describing the mode we just left.
++        self.refreshNames();
 +    }
 +
 +    fn setCollapsed(self: *Self, collapsed: bool) void {
@@ -409,7 +438,10 @@ index 0000000..5580fdf
 +    fn targetWidth(self: *Self) f64 {
 +        const priv = self.private();
 +        if (!priv.active) return 0;
-+        return @floatFromInt(if (priv.collapsed) rail_width else expanded_width);
++        return @floatFromInt(if (priv.collapsed)
++            priv.settings.width
++        else
++            priv.settings.expanded_width);
 +    }
 +
 +    fn applyCollapsed(self: *Self) void {
@@ -427,16 +459,17 @@ index 0000000..5580fdf
 +        self.toggleCssClass("collapsed", collapsed);
 +
 +        priv.new_tab_button.as(gtk.Widget).setVisible(
-+            @intFromBool(priv.new_button_enabled),
++            @intFromBool(priv.settings.new_button),
 +        );
 +    }
 +
 +    /// How visible labels should be at the given sidebar width. Tying this to
 +    /// the animated width rather than to the collapsed flag is what keeps the
 +    /// text and the rail in step.
-+    fn labelOpacity(width: f64) f64 {
-+        const rail: f64 = @floatFromInt(rail_width);
-+        const open: f64 = @floatFromInt(expanded_width);
++    fn labelOpacity(self: *Self, width: f64) f64 {
++        const priv = self.private();
++        const rail: f64 = @floatFromInt(priv.settings.width);
++        const open: f64 = @floatFromInt(priv.settings.expanded_width);
 +        if (open <= rail) return 1;
 +
 +        const progress = std.math.clamp((width - rail) / (open - rail), 0, 1);
@@ -461,7 +494,7 @@ index 0000000..5580fdf
 +    /// disagreement impossible: the row asks for exactly the state we are in.
 +    fn applyLabelFade(self: *Self, width: f64) void {
 +        const priv = self.private();
-+        const opacity = labelOpacity(width);
++        const opacity = self.labelOpacity(width);
 +
 +        const shown = !priv.collapsed;
 +        const flipped = shown != priv.last_labels_shown;
@@ -488,13 +521,29 @@ index 0000000..5580fdf
 +        const overview = priv.overview_button.as(gtk.Widget);
 +        const menu = priv.menu_button.as(gtk.Widget);
 +        overview.setOpacity(opacity);
-+        menu.setOpacity(opacity);
++
++        // Except in `rail` mode, where the sidebar never widens and hiding
++        // the menu with the labels would strand the user: the preferences
++        // that could put the sidebar back are behind that button, and there
++        // is no other way to reach them short of editing a file by hand. So
++        // it stays, and the top bar turns vertical to give it a row of its
++        // own -- side by side, two 32px chips do not fit in a 54px rail and
++        // the second one would be clipped off the edge.
++        const pinned = priv.settings.mode == .rail;
++        menu.setOpacity(if (pinned) 1 else opacity);
 +
 +        if (flipped) {
 +            label.setVisible(vis);
 +            overview.setVisible(vis);
-+            menu.setVisible(vis);
 +        }
++
++        // Unconditional: `flipped` only fires when the collapsed state
++        // changes, and in rail mode it never does, so a mode switch would
++        // otherwise never reach this. GTK ignores a set to the current value.
++        menu.setVisible(if (pinned) 1 else vis);
++        priv.top_bar.as(gtk.Orientable).setOrientation(
++            if (pinned) .vertical else .horizontal,
++        );
 +    }
 +
 +    /// Push `width` into the size request, the terminal's inset and the label
@@ -577,14 +626,28 @@ index 0000000..5580fdf
 +        const priv = self.private();
 +        const content = priv.content orelse return;
 +
-+        const rail: f64 = @floatFromInt(rail_width);
-+        const reserved = @min(width, rail);
++        const rail: f64 = @floatFromInt(priv.settings.width);
++
++        // How much of the sidebar the terminal has to make room for.
++        //
++        // `hover` and `rail` reserve the rail and no more, so an expansion
++        // floats over the terminal instead of reflowing it -- that overlay is
++        // the whole point of the hover design. `expanded` has no expansion to
++        // overlay *with*: the panel is simply always there, and a permanent
++        // widget sitting on top of the terminal would just be hiding the
++        // first 200-odd columns of every line.
++        const reserve_to: f64 = switch (priv.settings.mode) {
++            .hover, .rail => rail,
++            .expanded => @floatFromInt(priv.settings.expanded_width),
++        };
++        const reserved = @min(width, reserve_to);
 +
 +        // The gap fades in with the rail rather than being added flat, so
 +        // sliding out to nothing does not leave an 8px ledge behind at the
-+        // last frame.
++        // last frame. A configured width of zero would make that fraction a
++        // NaN, so it is spelled out rather than divided.
 +        const inset: c_int = @intFromFloat(
-+            reserved + (reserved / rail) * content_gap,
++            reserved + if (rail > 0) (reserved / rail) * content_gap else 0,
 +        );
 +
 +        // Expanding past the rail never changes the inset, so most frames of
@@ -622,9 +685,16 @@ index 0000000..5580fdf
 +        _: f64,
 +        self: *Self,
 +    ) callconv(.c) void {
++        const priv = self.private();
++
++        // Only `hover` mode reacts to the pointer at all. The other two pin
++        // the sidebar open or shut, and a stray motion event must not undo
++        // that.
++        if (priv.settings.mode != .hover) return;
++
 +        // Expanding is instant: any pending collapse is abandoned.
 +        self.cancelHoverTimer();
-+        if (self.private().active) self.setCollapsed(false);
++        if (priv.active) self.setCollapsed(false);
 +    }
 +
 +    fn hoverLeave(_: *gtk.EventControllerMotion, self: *Self) callconv(.c) void {
@@ -636,11 +706,16 @@ index 0000000..5580fdf
 +    /// sidebar -- collapsing it out from under the menu you just opened.
 +    fn armCollapse(self: *Self) void {
 +        const priv = self.private();
++        if (priv.settings.mode != .hover) return;
 +        if (priv.collapsed) return;
 +        if (priv.menu_button.getActive() != 0) return;
 +
 +        self.cancelHoverTimer();
-+        priv.hover_timer = glib.timeoutAdd(hover_collapse_ms, hoverTimer, self);
++        priv.hover_timer = glib.timeoutAdd(
++            priv.settings.collapse_delay,
++            hoverTimer,
++            self,
++        );
 +    }
 +
 +    fn menuActive(
@@ -805,11 +880,12 @@ index 0000000..5580fdf
 +                }
 +            }
 +
-+            applyRowName(row, path, depths[idx], duplicate_path);
++            self.applyRowName(row, path, depths[idx], duplicate_path);
 +        }
 +    }
 +
 +    fn applyRowName(
++        self: *Self,
 +        row: Row,
 +        path: ?[:0]const u8,
 +        depth: usize,
@@ -843,7 +919,32 @@ index 0000000..5580fdf
 +
 +        // The tooltip always carries the full path, so a grown or truncated
 +        // name never hides where the tab actually is.
-+        row.box.as(gtk.Widget).setTooltipText(p);
++        //
++        // In `rail` mode it carries the name as well, because that is the one
++        // mode where the row never shows its label: the sidebar does not
++        // expand, so the tooltip is the only place the name can appear. The
++        // other modes leave it out -- there the label is either on screen
++        // already or one hover away, and repeating it would just be noise.
++        //
++        // (In `hover` mode row tooltips are close to unreachable anyway:
++        // pointing at a row expands the sidebar immediately, which is a
++        // pointer-crossing event, and GTK restarts the tooltip timeout.)
++        if (self.private().settings.mode != .rail) {
++            row.box.as(gtk.Widget).setTooltipText(p);
++            return;
++        }
++
++        const tip = std.fmt.allocPrintSentinel(
++            alloc,
++            "{s}\n{s}",
++            .{ label_text, p },
++            0,
++        ) catch {
++            row.box.as(gtk.Widget).setTooltipText(p);
++            return;
++        };
++        defer alloc.free(tip);
++        row.box.as(gtk.Widget).setTooltipText(tip);
 +    }
 +
 +    fn pageIndex(tab_view: *adw.TabView, page: *adw.TabPage) ?usize {
@@ -871,7 +972,8 @@ index 0000000..5580fdf
 +        const box = gtk.Box.new(.horizontal, 6);
 +
 +        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
-+        icon.as(gtk.Widget).setSizeRequest(icon_chip, icon_chip);
++        const chip: c_int = @intCast(self.private().settings.icon_size);
++        icon.as(gtk.Widget).setSizeRequest(chip, chip);
 +        box.append(icon.as(gtk.Widget));
 +
 +        // The title sits in a vertical box with room for a second line. That
@@ -936,6 +1038,9 @@ index 0000000..5580fdf
 +        const text_box: *gtk.Box = @ptrCast(@alignCast(
 +            gobject.Object.getData(obj, key_text_box) orelse return,
 +        ));
++        const icon: *gtk.Image = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_icon_image) orelse return,
++        ));
 +        const close: *gtk.Button = @ptrCast(@alignCast(
 +            gobject.Object.getData(obj, key_close_button) orelse return,
 +        ));
@@ -963,6 +1068,7 @@ index 0000000..5580fdf
 +            .box = box,
 +            .text_box = text_box,
 +            .label = label,
++            .icon = icon,
 +            .close = close,
 +            .surface = surface,
 +            .pwd_handler = pwd_handler,
@@ -974,7 +1080,7 @@ index 0000000..5580fdf
 +        // directly rather than through applyLabelFade: that only touches
 +        // visibility when the shared state has just flipped, which would
 +        // leave this brand-new row mapped exactly as the blueprint built it.
-+        const opacity = labelOpacity(priv.current_width);
++        const opacity = self.labelOpacity(priv.current_width);
 +        const vis: c_int = @intFromBool(!priv.collapsed);
 +        text_box.as(gtk.Widget).setOpacity(opacity);
 +        close.as(gtk.Widget).setOpacity(opacity);
@@ -1086,7 +1192,9 @@ index 0000000..5580fdf
 +            );
 +
 +            class.bindTemplateChildPrivate("list_view", .{});
++            class.bindTemplateChildPrivate("top_bar", .{});
 +            class.bindTemplateChildPrivate("new_tab_button", .{});
++            class.bindTemplateChildPrivate("new_tab_icon", .{});
 +            class.bindTemplateChildPrivate("new_tab_label", .{});
 +            class.bindTemplateChildPrivate("overview_button", .{});
 +            class.bindTemplateChildPrivate("menu_button", .{});
@@ -1108,18 +1216,19 @@ index 0000000..5580fdf
 +    };
 +};
 diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
-index c01cad6..6149dda 100644
+index c01cad6..d352b21 100644
 --- a/src/apprt/gtk/class/window.zig
 +++ b/src/apprt/gtk/class/window.zig
-@@ -28,6 +28,7 @@ const Surface = @import("surface.zig").Surface;
+@@ -28,6 +28,8 @@ const Surface = @import("surface.zig").Surface;
  const Tab = @import("tab.zig").Tab;
  const DebugWarning = @import("debug_warning.zig").DebugWarning;
  const CommandPalette = @import("command_palette.zig").CommandPalette;
 +const TabSidebar = @import("tab_sidebar.zig").TabSidebar;
++const SidebarSettings = @import("../tab_sidebar_settings.zig");
  const WeakRef = @import("../weak_ref.zig").WeakRef;
  
  const log = std.log.scoped(.gtk_ghostty_window);
-@@ -195,6 +196,21 @@ pub const Window = extern struct {
+@@ -195,6 +197,21 @@ pub const Window = extern struct {
              );
          };
  
@@ -1141,7 +1250,7 @@ index c01cad6..6149dda 100644
          pub const @"toolbar-style" = struct {
              pub const name = "toolbar-style";
              const impl = gobject.ext.defineProperty(
-@@ -262,6 +278,9 @@ pub const Window = extern struct {
+@@ -262,6 +279,9 @@ pub const Window = extern struct {
          tab_view: *adw.TabView,
          toolbar: *adw.ToolbarView,
          toast_overlay: *adw.ToastOverlay,
@@ -1151,7 +1260,7 @@ index c01cad6..6149dda 100644
  
          pub var offset: c_int = 0;
      };
-@@ -304,6 +323,48 @@ pub const Window = extern struct {
+@@ -304,6 +324,48 @@ pub const Window = extern struct {
              break :config config.get();
          };
  
@@ -1200,7 +1309,7 @@ index c01cad6..6149dda 100644
          // We initialize our windowing protocol to none because we can't
          // actually initialize this until we get realized.
          priv.winproto = .none;
-@@ -373,6 +434,7 @@ pub const Window = extern struct {
+@@ -373,6 +435,7 @@ pub const Window = extern struct {
              .init("clear", actionClear, null),
              // TODO: accept the surface that toggled the command palette
              .init("toggle-command-palette", actionToggleCommandPalette, null),
@@ -1208,7 +1317,7 @@ index c01cad6..6149dda 100644
              .init("toggle-inspector", actionToggleInspector, null),
          };
  
-@@ -664,6 +726,7 @@ pub const Window = extern struct {
+@@ -664,6 +727,7 @@ pub const Window = extern struct {
          // Trigger all our dynamic properties that depend on the config.
          inline for (&.{
              "headerbar-visible",
@@ -1216,7 +1325,7 @@ index c01cad6..6149dda 100644
              "tabs-autohide",
              "tabs-visible",
              "tabs-wide",
-@@ -693,13 +756,18 @@ pub const Window = extern struct {
+@@ -693,13 +757,28 @@ pub const Window = extern struct {
                  config.@"window-theme" == .ghostty,
          );
  
@@ -1232,24 +1341,35 @@ index c01cad6..6149dda 100644
              .bottom => priv.toolbar.addBottomBar(priv.tab_bar.as(gtk.Widget)),
          }
  
++        // Re-read the sidebar's own settings. This is the only place they are
++        // loaded, because loading touches the filesystem -- the config is the
++        // baseline but `sidebar.conf` is layered on top -- and
++        // `syncSidebarLayout` runs on every tab open and close, which is far
++        // too often to be reading a file.
++        priv.tab_sidebar.setSettings(SidebarSettings.load(
++            Application.default().allocator(),
++            config,
++        ));
++
 +        self.syncSidebarLayout();
 +
          // Do our window-protocol specific appearance sync.
          priv.winproto.syncAppearance() catch |err| {
              log.warn("failed to sync winproto appearance error={}", .{err});
-@@ -1011,10 +1079,43 @@ pub const Window = extern struct {
+@@ -1011,10 +1090,43 @@ pub const Window = extern struct {
          };
      }
  
-+    /// The vertical tab sidebar is shown only when tabs are located on a side
-+    /// and there is more than one tab. With a single tab the sidebar would
-+    /// just be a one-row list, so we hide it and give the space back to the
-+    /// terminal.
++    /// The vertical tab sidebar is shown when tabs are located on a side. With
++    /// a single tab it would just be a one-row list, so by default we hide it
++    /// and give the space back to the terminal; `gtk-tabs-sidebar-auto-hide`
++    /// turns that off for anyone who would rather it never move.
 +    fn getSidebarVisible(self: *Self) bool {
 +        const priv = self.private();
 +        const config = if (priv.config) |v| v.get() else return false;
 +        return switch (config.@"gtk-tabs-location") {
-+            .left, .right => priv.tab_view.getNPages() > 1,
++            .left, .right => priv.tab_view.getNPages() > 1 or
++                !priv.tab_sidebar.getSettings().auto_hide,
 +            .top, .bottom => false,
 +        };
 +    }
@@ -1263,7 +1383,6 @@ index c01cad6..6149dda 100644
 +
 +        const on_right = config.@"gtk-tabs-location" == .right;
 +        priv.tab_sidebar.as(gtk.Widget).setHalign(if (on_right) .end else .start);
-+        priv.tab_sidebar.setNewButtonEnabled(config.@"gtk-tabs-sidebar-new-button");
 +        priv.tab_sidebar.setContentInset(priv.content_box.as(gtk.Widget), on_right);
 +        priv.tab_sidebar.setActive(self.getSidebarVisible());
 +    }
@@ -1281,7 +1400,7 @@ index c01cad6..6149dda 100644
          switch (config.@"gtk-titlebar-style") {
              .tabs => {
                  // *Conditionally* disable the tab bar when maximized, the titlebar
-@@ -1488,6 +1589,9 @@ pub const Window = extern struct {
+@@ -1488,6 +1600,9 @@ pub const Window = extern struct {
          _: c_int,
          self: *Self,
      ) callconv(.c) void {
@@ -1291,7 +1410,7 @@ index c01cad6..6149dda 100644
          // Get the attached page which must be a Tab object.
          const child = page.getChild();
          const tab = gobject.ext.cast(Tab, child) orelse return;
-@@ -1579,12 +1683,69 @@ pub const Window = extern struct {
+@@ -1579,12 +1694,69 @@ pub const Window = extern struct {
          priv.tab_view.closePage(page);
      }
  
@@ -1361,7 +1480,7 @@ index c01cad6..6149dda 100644
          if (priv.tab_view.getNPages() == 0) {
              // If we have no pages left then we want to close window.
  
-@@ -1839,6 +2000,17 @@ pub const Window = extern struct {
+@@ -1839,6 +2011,17 @@ pub const Window = extern struct {
          self.performBindingAction(.new_window);
      }
  
@@ -1379,7 +1498,7 @@ index c01cad6..6149dda 100644
      fn actionNewTab(
          _: *gio.SimpleAction,
          _: ?*glib.Variant,
-@@ -2061,6 +2233,7 @@ pub const Window = extern struct {
+@@ -2061,6 +2244,7 @@ pub const Window = extern struct {
              gobject.ext.ensureType(SplitTree);
              gobject.ext.ensureType(Surface);
              gobject.ext.ensureType(Tab);
@@ -1387,7 +1506,7 @@ index c01cad6..6149dda 100644
              gtk.Widget.Class.setTemplateFromResource(
                  class.as(gtk.Widget.Class),
                  comptime gresource.blueprint(.{
-@@ -2078,6 +2251,7 @@ pub const Window = extern struct {
+@@ -2078,6 +2262,7 @@ pub const Window = extern struct {
                  properties.@"headerbar-visible".impl,
                  properties.@"quick-terminal".impl,
                  properties.@"tabs-autohide".impl,
@@ -1395,7 +1514,7 @@ index c01cad6..6149dda 100644
                  properties.@"tabs-visible".impl,
                  properties.@"tabs-wide".impl,
                  properties.@"toolbar-style".impl,
-@@ -2090,6 +2264,9 @@ pub const Window = extern struct {
+@@ -2090,6 +2275,9 @@ pub const Window = extern struct {
              class.bindTemplateChildPrivate("tab_view", .{});
              class.bindTemplateChildPrivate("toolbar", .{});
              class.bindTemplateChildPrivate("toast_overlay", .{});
@@ -1576,12 +1695,348 @@ index 9c0f115..4402cbf 100644
 +.ghostty-tab-sidebar-dim.active {
 +  background-color: rgba(0, 0, 0, 0.35);
 +}
+diff --git a/src/apprt/gtk/tab_sidebar_settings.zig b/src/apprt/gtk/tab_sidebar_settings.zig
+new file mode 100644
+index 0000000..667bab5
+--- /dev/null
++++ b/src/apprt/gtk/tab_sidebar_settings.zig
+@@ -0,0 +1,330 @@
++//! Live settings for the vertical tab sidebar.
++//!
++//! Every value here also exists as a `gtk-tabs-sidebar-*` config option. The
++//! config is the baseline; this module layers a small file of its own on top
++//! so the sidebar's own menu can change things without editing the user's
++//! hand-written config.
++//!
++//! That split is deliberate. Ghostty never writes its config file -- the only
++//! thing it does with it is open it in an editor -- and a patch that started
++//! rewriting a file the user maintains by hand would have to preserve their
++//! comments, ordering and formatting to be safe. Instead the sidebar owns
++//! `$XDG_CONFIG_HOME/ghostty/sidebar.conf`, writes only keys it recognises,
++//! and rewrites it wholesale because everything in it is ours.
++//!
++//! Precedence, lowest to highest: field default, `gtk-tabs-sidebar-*` from
++//! the config, then `sidebar.conf`. So a value the user has never touched in
++//! the menu keeps following their config.
++
++const std = @import("std");
++
++const glib = @import("glib");
++
++const Config = @import("../../config.zig").Config;
++
++const log = std.log.scoped(.gtk_ghostty_tab_sidebar);
++
++pub const Mode = Config.GtkTabsSidebarMode;
++pub const Subtitle = Config.GtkTabsSidebarSubtitle;
++
++pub const Settings = @This();
++
++/// Geometry.
++width: u16 = 54,
++expanded_width: u16 = 260,
++corner_radius: u8 = 12,
++icon_size: u8 = 32,
++border: bool = true,
++
++/// Timing, in milliseconds.
++animation_duration: u16 = 320,
++collapse_delay: u16 = 400,
++
++/// Behaviour.
++auto_hide: bool = true,
++mode: Mode = .hover,
++new_button: bool = true,
++
++/// Row content.
++git_branch: bool = true,
++subtitle: Subtitle = .title,
++indicators: bool = true,
++
++/// The file we own, relative to the user's config directory.
++const file_name = "sidebar.conf";
++
++/// Every field, paired with the name used in `sidebar.conf`. Keeping this in
++/// one place is what lets load, save and the preferences dialog stay in step:
++/// adding a setting means adding one line here and one field above.
++pub const keys = .{
++    .{ "width", "width" },
++    .{ "expanded-width", "expanded_width" },
++    .{ "corner-radius", "corner_radius" },
++    .{ "icon-size", "icon_size" },
++    .{ "border", "border" },
++    .{ "animation-duration", "animation_duration" },
++    .{ "collapse-delay", "collapse_delay" },
++    .{ "auto-hide", "auto_hide" },
++    .{ "mode", "mode" },
++    .{ "new-button", "new_button" },
++    .{ "git-branch", "git_branch" },
++    .{ "subtitle", "subtitle" },
++    .{ "indicators", "indicators" },
++};
++
++/// Start from the config. This is the baseline the file is layered onto.
++pub fn fromConfig(config: *const Config) Settings {
++    return .{
++        .width = config.@"gtk-tabs-sidebar-width",
++        .expanded_width = config.@"gtk-tabs-sidebar-expanded-width",
++        .corner_radius = config.@"gtk-tabs-sidebar-corner-radius",
++        .icon_size = config.@"gtk-tabs-sidebar-icon-size",
++        .border = config.@"gtk-tabs-sidebar-border",
++        .animation_duration = config.@"gtk-tabs-sidebar-animation-duration",
++        .collapse_delay = config.@"gtk-tabs-sidebar-collapse-delay",
++        .auto_hide = config.@"gtk-tabs-sidebar-auto-hide",
++        .mode = config.@"gtk-tabs-sidebar-mode",
++        .new_button = config.@"gtk-tabs-sidebar-new-button",
++        .git_branch = config.@"gtk-tabs-sidebar-git-branch",
++        .subtitle = config.@"gtk-tabs-sidebar-subtitle",
++        .indicators = config.@"gtk-tabs-sidebar-indicators",
++    };
++}
++
++/// Config values with `sidebar.conf` layered on top. A missing or unreadable
++/// file is not an error: it just means nothing has overridden the config yet.
++pub fn load(alloc: std.mem.Allocator, config: *const Config) Settings {
++    var self = fromConfig(config);
++
++    const path = configPath(alloc) catch return self;
++    defer alloc.free(path);
++
++    const contents = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024) catch |err| switch (err) {
++        error.FileNotFound => return self,
++        else => {
++            log.warn("unable to read {s}: {}", .{ path, err });
++            return self;
++        },
++    };
++    defer alloc.free(contents);
++
++    self.parse(contents);
++    self.normalize();
++    return self;
++}
++
++/// Force the geometry into a shape the sidebar can actually draw.
++///
++/// These used to be a `comptime` assertion, which a configurable width cannot
++/// be: a bad value now arrives at runtime from a config file. Refusing to
++/// start over it would be worse than nudging it, so each rule adjusts the
++/// value and says so once.
++///
++/// The evenness rule is the load-bearing one. The icon chip is centred by
++/// equal CSS margins of `(width - icon_size) / 2`, so an odd difference
++/// cannot be split evenly and every icon sits half a pixel off the rail's
++/// centre line -- visible as a column that drifts against the "+" button.
++pub fn normalize(self: *Settings) void {
++    // An expanded panel narrower than the rail would animate backwards.
++    if (self.expanded_width < self.width) {
++        log.warn(
++            "sidebar expanded-width {d} is under width {d}; using {d}",
++            .{ self.expanded_width, self.width, self.width },
++        );
++        self.expanded_width = self.width;
++    }
++
++    // The chip has to fit inside the rail with room to centre it.
++    const width_u8 = std.math.cast(u8, self.width) orelse std.math.maxInt(u8);
++    if (self.icon_size > width_u8) {
++        log.warn(
++            "sidebar icon-size {d} exceeds width {d}; using {d}",
++            .{ self.icon_size, self.width, width_u8 },
++        );
++        self.icon_size = width_u8;
++    }
++
++    if ((self.width -| @as(u16, self.icon_size)) % 2 != 0) {
++        self.icon_size -|= 1;
++        log.warn(
++            "sidebar width {d} and icon-size cannot be centred; icon-size is now {d}",
++            .{ self.width, self.icon_size },
++        );
++    }
++}
++
++/// Margins that centre an icon chip in the rail, in pixels.
++///
++/// The pair is derived, never written down twice. A row's icon gets the plain
++/// half-difference; the "New Tab" button gets that less `button_padding`,
++/// because a flat GTK button carries Adwaita padding of its own that our
++/// `padding: 0` does not win against. Hardcoding either one drifts the moment
++/// the width changes.
++pub const button_padding: u16 = 6;
++
++pub fn iconMargin(self: *const Settings) u16 {
++    return (self.width -| @as(u16, self.icon_size)) / 2;
++}
++
++pub fn newButtonMargin(self: *const Settings) u16 {
++    return self.iconMargin() -| button_padding;
++}
++
++/// Apply `key = value` lines. Unknown keys and unparseable values are skipped
++/// with a warning rather than discarding the whole file: a setting we no
++/// longer recognise should not cost the user every other setting.
++fn parse(self: *Settings, contents: []const u8) void {
++    var lines = std.mem.splitScalar(u8, contents, '\n');
++    while (lines.next()) |raw| {
++        const line = std.mem.trim(u8, raw, " \t\r");
++        if (line.len == 0 or line[0] == '#') continue;
++
++        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
++        const key = std.mem.trim(u8, line[0..eq], " \t");
++        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
++
++        if (!self.set(key, value)) {
++            log.warn("ignoring unrecognised sidebar setting: {s}", .{key});
++        }
++    }
++}
++
++/// Assign one key from its textual value. Returns false if the key is unknown
++/// or the value does not parse.
++pub fn set(self: *Settings, key: []const u8, value: []const u8) bool {
++    inline for (keys) |pair| {
++        const name, const field = pair;
++        if (std.mem.eql(u8, key, name)) {
++            const T = @TypeOf(@field(self, field));
++            @field(self, field) = switch (@typeInfo(T)) {
++                .bool => parseBool(value) orelse return false,
++                .int => std.fmt.parseInt(T, value, 10) catch return false,
++                .@"enum" => std.meta.stringToEnum(T, value) orelse return false,
++                else => @compileError("unhandled sidebar setting type"),
++            };
++            return true;
++        }
++    }
++    return false;
++}
++
++fn parseBool(value: []const u8) ?bool {
++    if (std.mem.eql(u8, value, "true")) return true;
++    if (std.mem.eql(u8, value, "false")) return false;
++    return null;
++}
++
++/// Write every setting back out. The file is ours alone, so it is rewritten
++/// whole rather than patched line by line.
++pub fn save(self: *const Settings, alloc: std.mem.Allocator) !void {
++    const path = try configPath(alloc);
++    defer alloc.free(path);
++
++    if (std.fs.path.dirname(path)) |dir| {
++        std.fs.cwd().makePath(dir) catch |err| switch (err) {
++            error.PathAlreadyExists => {},
++            else => return err,
++        };
++    }
++
++    var buf: std.ArrayListUnmanaged(u8) = .empty;
++    defer buf.deinit(alloc);
++    const w = buf.writer(alloc);
++
++    try w.writeAll(
++        \\# Written by Ghostty's vertical tab sidebar. Edits are kept, but the
++        \\# file is rewritten whenever a setting changes from the sidebar menu,
++        \\# so comments of your own will not survive.
++        \\#
++        \\# These override the matching gtk-tabs-sidebar-* options in your
++        \\# Ghostty config. Delete a line to go back to following the config.
++        \\
++        \\
++    );
++
++    inline for (keys) |pair| {
++        const name, const field = pair;
++        const value = @field(self, field);
++        switch (@typeInfo(@TypeOf(value))) {
++            .bool => try w.print("{s} = {s}\n", .{ name, if (value) "true" else "false" }),
++            .int => try w.print("{s} = {d}\n", .{ name, value }),
++            .@"enum" => try w.print("{s} = {s}\n", .{ name, @tagName(value) }),
++            else => unreachable,
++        }
++    }
++
++    // Write to a temporary file and rename over the target, so an interrupted
++    // write cannot leave a half-written settings file behind.
++    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
++    defer alloc.free(tmp);
++
++    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = buf.items });
++    try std.fs.cwd().rename(tmp, path);
++}
++
++fn configPath(alloc: std.mem.Allocator) ![]u8 {
++    const dir = glib.getUserConfigDir();
++    return std.fs.path.join(alloc, &.{ std.mem.span(dir), "ghostty", file_name });
++}
++
++test "parse overrides config values" {
++    const testing = std.testing;
++
++    var s: Settings = .{};
++    s.parse(
++        \\# a comment
++        \\width = 70
++        \\border = false
++        \\subtitle = path
++        \\nonsense = 12
++        \\
++    );
++
++    try testing.expectEqual(@as(u16, 70), s.width);
++    try testing.expectEqual(false, s.border);
++    try testing.expectEqual(Subtitle.path, s.subtitle);
++
++    // Untouched keys keep their prior value.
++    try testing.expectEqual(@as(u16, 260), s.expanded_width);
++}
++
++test "bad values leave the field alone" {
++    const testing = std.testing;
++
++    var s: Settings = .{};
++    try testing.expectEqual(false, s.set("width", "wide"));
++    try testing.expectEqual(@as(u16, 54), s.width);
++}
++
++test "normalize keeps the icon centreable" {
++    const testing = std.testing;
++
++    // An odd difference cannot be split into equal margins, so the chip
++    // shrinks by one until it can be.
++    var s: Settings = .{ .width = 54, .icon_size = 33 };
++    s.normalize();
++    try testing.expectEqual(@as(u8, 32), s.icon_size);
++    try testing.expectEqual(@as(u16, 11), s.iconMargin());
++    try testing.expectEqual(@as(u16, 5), s.newButtonMargin());
++
++    // A chip wider than the rail is clamped to it, which also makes the
++    // margins zero rather than negative.
++    var big: Settings = .{ .width = 20, .icon_size = 64 };
++    big.normalize();
++    try testing.expectEqual(@as(u8, 20), big.icon_size);
++    try testing.expectEqual(@as(u16, 0), big.iconMargin());
++    try testing.expectEqual(@as(u16, 0), big.newButtonMargin());
++}
++
++test "mode round-trips through the file format" {
++    const testing = std.testing;
++
++    var s: Settings = .{};
++    try testing.expectEqual(Mode.hover, s.mode);
++    s.parse("mode = rail\n");
++    try testing.expectEqual(Mode.rail, s.mode);
++
++    // The old boolean spelling is not silently accepted as a mode.
++    try testing.expectEqual(false, s.set("mode", "true"));
++    try testing.expectEqual(Mode.rail, s.mode);
++}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..c7aa736
+index 0000000..a9cc837
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,214 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1635,21 +2090,23 @@ index 0000000..c7aa736
 +        // address its label on its own.
 +        //
 +        // No margin here -- the button's own margins in CSS centre it in the
-+        // rail. The fixed 32px square must match TabSidebar.icon_chip:
++        // rail. The square is sized from Zig to match the tab rows', because
 +        // symbolic icons differ in natural width, so aligning on the box
 +        // rather than the glyph is what keeps the "+" in line with the tab
-+        // icons below.
++        // icons below. The values here are only the default, for the moment
++        // between the template being built and the first settings push.
 +        // No margin here. This used to carry a hand-measured margin-start of
 +        // 4px to line the "+" up with the tab icons, which was only ever
 +        // compensating for the listview insets that pushed the rows off
-+        // centre. With those gone both the button and the rows are bare 32px
-+        // chips and the viewport centres them on the same axis.
++        // centre. With those gone both the button and the rows are bare
++        // chips of the same size and the viewport centres them on the same
++        // axis.
 +        child: Gtk.Box {
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
 +
-+          Gtk.Image {
++          Gtk.Image new_tab_icon {
 +            icon-name: "tab-new-symbolic";
 +            width-request: 32;
 +            height-request: 32;
@@ -1692,8 +2149,9 @@ index 0000000..c7aa736
 +
 +    // propagate-natural-width and overlay-scrolling both matter: without
 +    // them the vertical scrollbar reserves layout width once there are
-+    // enough tabs to scroll, making the rail wider than rail_width while the
-+    // terminal's inset stays put -- so the rail creeps over the terminal.
++    // enough tabs to scroll, making the rail wider than the configured width
++    // while the terminal's inset stays put -- so the rail creeps over the
++    // terminal.
 +    Gtk.ScrolledWindow {
 +      vexpand: true;
 +      hscrollbar-policy: never;
@@ -1870,7 +2328,7 @@ index b66a930..cc77400 100644
        }
      }
 diff --git a/src/config/Config.zig b/src/config/Config.zig
-index 278ffd7..71565b8 100644
+index 278ffd7..8bc35e0 100644
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
 @@ -3572,7 +3572,13 @@ else
@@ -1888,7 +2346,7 @@ index 278ffd7..71565b8 100644
  ///
  /// When `hidden` is set, a tab button displaying the number of tabs will appear
  /// in the title bar. It has the ability to open a tab overview for displaying
-@@ -3581,6 +3587,13 @@ else
+@@ -3581,6 +3587,85 @@ else
  /// with keybinds.
  @"gtk-tabs-location": GtkTabsLocation = .top,
  
@@ -1899,15 +2357,101 @@ index 278ffd7..71565b8 100644
 +/// tab list and create tabs from a keybind instead.
 +@"gtk-tabs-sidebar-new-button": bool = true,
 +
++/// Width in pixels of the collapsed tab sidebar: the icon rail that is always
++/// on screen. Only has an effect when `gtk-tabs-location` is `left` or
++/// `right`.
++///
++/// The rail includes its own trailing padding, so this is the full distance
++/// from the window edge to the terminal, and the tab icons are centered
++/// within it.
++@"gtk-tabs-sidebar-width": u16 = 54,
++
++/// Width in pixels of the tab sidebar once it expands, showing tab names.
++/// Only has an effect when `gtk-tabs-location` is `left` or `right`.
++///
++/// The expanded sidebar floats over the terminal rather than pushing it, so
++/// this does not affect how much room the terminal has.
++@"gtk-tabs-sidebar-expanded-width": u16 = 260,
++
++/// How long the tab sidebar takes to expand or collapse, in milliseconds.
++/// Set to `0` to switch between the two states instantly.
++@"gtk-tabs-sidebar-animation-duration": u16 = 320,
++
++/// How long the tab sidebar waits before collapsing after the pointer leaves
++/// it, in milliseconds. A delay keeps it from snapping shut when you briefly
++/// overshoot a row or cross a gap.
++@"gtk-tabs-sidebar-collapse-delay": u16 = 400,
++
++/// Corner radius in pixels of the tab sidebar's terminal-facing edge. Set to
++/// `0` for a square edge flush against the terminal.
++@"gtk-tabs-sidebar-corner-radius": u8 = 12,
++
++/// Size in pixels of the square each tab icon is drawn in. This also sets the
++/// size of the rounded chip behind a selected tab.
++///
++/// Must be smaller than `gtk-tabs-sidebar-width`, otherwise the rail cannot
++/// center it and the icons are pushed off the edge.
++@"gtk-tabs-sidebar-icon-size": u8 = 32,
++
++/// If `true`, draw a hairline along the tab sidebar's terminal-facing edge.
++@"gtk-tabs-sidebar-border": bool = true,
++
++/// If `true`, hide the tab sidebar entirely while there is only one tab,
++/// sliding it back in when a second tab appears.
++@"gtk-tabs-sidebar-auto-hide": bool = true,
++
++/// How the tab sidebar behaves.
++///
++///   * `hover` - rest as the narrow icon rail and expand over the terminal
++///     while the pointer is on it.
++///   * `expanded` - always show the full width with tab names. The sidebar
++///     never animates and never overlays the terminal.
++///   * `rail` - always show the narrow icon rail. Tab names are never shown
++///     inline; hovering an icon puts them in a tooltip instead.
++@"gtk-tabs-sidebar-mode": GtkTabsSidebarMode = .hover,
++
++/// If `true`, show the current git branch on each tab in the expanded
++/// sidebar. The branch is read from the tab's working directory and updates
++/// when you switch branches.
++///
++/// This costs a file monitor per tab on the repository's `HEAD`. Set it to
++/// `false` if you do not want that.
++@"gtk-tabs-sidebar-git-branch": bool = true,
++
++/// What to show on the second line of each tab in the expanded sidebar.
++///
++///   * `none` - nothing; tabs are a single line.
++///   * `title` - the tab's title, which usually names the running command.
++///   * `path` - the tab's working directory.
++@"gtk-tabs-sidebar-subtitle": GtkTabsSidebarSubtitle = .title,
++
++/// If `true`, show status indicators on tabs in the sidebar: a dot when a tab
++/// rings its bell while unfocused, and a padlock when it is read-only.
++@"gtk-tabs-sidebar-indicators": bool = true,
++
  /// If this is `true`, the titlebar will be hidden when the window is maximized,
  /// and shown when the titlebar is unmaximized. GTK only.
  ///
-@@ -8985,6 +8998,8 @@ pub const GtkSingleInstance = enum {
+@@ -8985,6 +9070,22 @@ pub const GtkSingleInstance = enum {
  pub const GtkTabsLocation = enum {
      top,
      bottom,
 +    left,
 +    right,
++};
++
++/// See gtk-tabs-sidebar-mode
++pub const GtkTabsSidebarMode = enum {
++    hover,
++    expanded,
++    rail,
++};
++
++/// See gtk-tabs-sidebar-subtitle
++pub const GtkTabsSidebarSubtitle = enum {
++    none,
++    title,
++    path,
  };
  
  /// See gtk-toolbar-style
