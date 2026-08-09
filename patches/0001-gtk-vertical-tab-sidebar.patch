@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..2ee7551
+index 0000000..14af76a
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1007 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -266,9 +266,14 @@ index 0000000..2ee7551
 +            .{},
 +        );
 +
-+        // Entering expands instantly; leaving collapses after a delay.
++        // Expansion is driven by `motion`, not `enter`, on purpose. A sidebar
++        // that appears underneath a stationary pointer -- which is exactly
++        // what happens when opening a second tab from the rail -- receives an
++        // enter event immediately and would fling itself open. Requiring
++        // actual pointer movement means it only opens when you really move
++        // onto it.
 +        const motion = gtk.EventControllerMotion.new();
-+        _ = gtk.EventControllerMotion.signals.enter.connect(motion, *Self, &hoverEnter, self, .{});
++        _ = gtk.EventControllerMotion.signals.motion.connect(motion, *Self, &hoverEnter, self, .{});
 +        _ = gtk.EventControllerMotion.signals.leave.connect(motion, *Self, &hoverLeave, self, .{});
 +        self.as(gtk.Widget).addController(motion.as(gtk.EventController));
 +
@@ -1467,7 +1472,7 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..f06f653
+index 0000000..49247b7
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 @@ -0,0 +1,192 @@
@@ -1521,7 +1526,7 @@ index 0000000..f06f653
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
-+          margin-start: 5;
++          margin-start: 4;
 +
 +          Gtk.Image {
 +            icon-name: "tab-new-symbolic";
