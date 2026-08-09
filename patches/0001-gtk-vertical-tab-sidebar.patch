@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..549966e
+index 0000000..e40fa3a
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1049 @@
+@@ -0,0 +1,1060 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -213,7 +213,12 @@ index 0000000..549966e
 +        /// frame relaid out the terminal and re-mapped every label sixty
 +        /// times a second, which is what made the slide stutter.
 +        last_inset: c_int = -1,
-+        last_labels_shown: bool = false,
++
++        /// Must start true: the blueprint builds the labels visible, so
++        /// seeding this false made the first "hide" look like a no-op and
++        /// they were never hidden at all -- leaving a 98px row clipped into
++        /// a 46px rail.
++        last_labels_shown: bool = true,
 +
 +        /// Currently realized rows.
 +        rows: std.ArrayListUnmanaged(Row) = .empty,
@@ -295,9 +300,7 @@ index 0000000..549966e
 +
 +        self.as(gtk.Widget).setVisible(0);
 +        self.applyCollapsed();
-+
 +    }
-+
 +
 +    fn dispose(self: *Self) callconv(.c) void {
 +        const priv = self.private();
@@ -947,8 +950,16 @@ index 0000000..549966e
 +        }) catch return;
 +
 +        // A row realized mid-animation has to match the fade already in
-+        // progress, not the end state.
-+        self.applyLabelFade(priv.current_width);
++        // progress, not the end state. Set it directly rather than through
++        // applyLabelFade: that skips visibility unless the shared state has
++        // just flipped, which would leave this brand-new row showing whatever
++        // the blueprint built it as.
++        const opacity = labelOpacity(priv.current_width);
++        const vis: c_int = @intFromBool(opacity > 0.01);
++        text_box.as(gtk.Widget).setOpacity(opacity);
++        close.as(gtk.Widget).setOpacity(opacity);
++        text_box.as(gtk.Widget).setVisible(vis);
++        close.as(gtk.Widget).setVisible(vis);
 +
 +        self.refreshNames();
 +    }
