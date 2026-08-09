@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..6b5660b
+index 0000000..5580fdf
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1079 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -71,7 +71,18 @@ index 0000000..6b5660b
 +    });
 +
 +    /// Width of the collapsed icon rail and of the expanded list.
-+    pub const rail_width: c_int = 46;
++    ///
++    /// The rail is 46px of icon column plus 8px of breathing room before the
++    /// terminal, and it owns both. The gap used to be a margin on the
++    /// terminal instead, which left 8px of *window* background showing
++    /// between the rail and the terminal -- and since the rail's edge
++    /// hairline is drawn at the rail's own right edge, the line ended up
++    /// floating 8px inside the visible band rather than marking where the
++    /// terminal begins. Depending on the theme that read as a stray line or,
++    /// where the window background is darker than the sidebar, as a black
++    /// stripe. Owning the gap makes the band one uniform colour and puts the
++    /// hairline exactly on the boundary.
++    pub const rail_width: c_int = 54;
 +    const expanded_width: c_int = 260;
 +
 +    /// Expanding is instant on pointer enter. Collapsing waits, so that
@@ -88,11 +99,10 @@ index 0000000..6b5660b
 +    /// snapping out from under you.
 +    const label_fade_start: f64 = 0.35;
 +
-+    /// Breathing room between the rail and the terminal. The rail reserves
-+    /// its own width plus this, so terminal text never butts up against the
-+    /// sidebar's edge -- the two occupy strictly separate space rather than
-+    /// merely not overlapping.
-+    const content_gap: f64 = 8;
++    /// Extra inset on the terminal beyond the rail's own width. Zero: the
++    /// breathing room is inside `rail_width` now, painted in the sidebar's
++    /// own colour, so nothing shows through between the two.
++    const content_gap: f64 = 0;
 +
 +    /// Every icon sits in a fixed square of this size, in rows and in the
 +    /// "New Tab" button alike. Aligning on a fixed box rather than on the
@@ -1412,10 +1422,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..ff3fb43 100644
+index 9c0f115..628b803 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,116 @@ label.resize-overlay {
+@@ -181,3 +181,146 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1474,18 +1484,48 @@ index 9c0f115..ff3fb43 100644
 +}
 +
 +.ghostty-tab-sidebar.collapsed listview > row {
-+  margin: 2px 7px;
++  /* (rail_width - icon_chip) / 2 = (54 - 32) / 2 = 11, so the chip is a 32px
++   * square on the rail's axis. A row fills the rail's width, so this margin
++   * is what sets the chip's size -- get it wrong and the chip stretches
++   * while the icon stays packed at its start, throwing the glyph off centre. */
++  margin: 2px 11px;
 +  min-height: 32px;
 +  border-radius: 10px;
 +}
++
++/*
++ * The rail's content must be exactly rail_width across. GtkViewport centres
++ * content it cannot fit, so anything wider does not merely clip on the right
++ * -- the whole column slides left and the icons go off-axis. That was the
++ * bug: with Adwaita's navigation-sidebar row geometry in play the content
++ * measured 64px inside a 46px rail, and the icons hung 9px off the left edge
++ * (measured: content box x=-18 w=64, icon centre 14 against a rail centre of
++ * 23). The listview no longer carries that class, so the arithmetic below is
++ * the whole story: 32px chip + 7px each side = 46.
++ *
++ * `!important` on the padding is not decoration. Adwaita's own padding for
++ * these nodes outranks ours in the cascade -- measured, our margins applied
++ * and our padding did not -- and padding here is not cosmetic, it decides
++ * whether the content still fits the rail.
++ */
 +
 +/* Same treatment for the pinned "New Tab" button, so it sits in the column
 + * rather than floating above it. The 7px side margins are the only thing
 + * centering either one: 46 - 32 = 14, split evenly. Nothing else may add an
 + * indent, or the content exceeds the rail and pushes it over the terminal. */
 +.ghostty-tab-sidebar button.flat {
++  /* 1px, not 7px, because a flat button carries 6px of Adwaita padding of
++   * its own that our `padding: 0` does not win against -- measured twice, in
++   * both states. 1 + 6 puts the "+" glyph on exactly the same axis as the
++   * row icons, which start at 7. Re-measure before changing either number;
++   * they are a pair. */
++  /* 5px, against the rows' 11px, because a flat button also carries 6px of
++   * Adwaita padding that our `padding: 0` does not win against (measured in
++   * both states). 5 + 6 = 11 puts the "+" glyph on exactly the same axis as
++   * the row icons. Re-measure before changing either number; they are a
++   * pair, and they both depend on rail_width. */
 +  padding: 0;
-+  margin: 6px 7px 2px;
++  margin: 6px 5px 2px;
 +  border-radius: 8px;
 +  min-height: 32px;
 +}
@@ -1534,10 +1574,10 @@ index 9c0f115..ff3fb43 100644
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..20102bc
+index 0000000..c7aa736
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,211 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -1595,15 +1635,15 @@ index 0000000..20102bc
 +        // symbolic icons differ in natural width, so aligning on the box
 +        // rather than the glyph is what keeps the "+" in line with the tab
 +        // icons below.
-+        // margin-start is measured, not derived. The button spans the full
-+        // sidebar width while GtkListView insets its rows, so without this
-+        // the "+" sits left of every tab icon. If rail_width or the row
-+        // margins change, re-measure rather than recompute.
++        // No margin here. This used to carry a hand-measured margin-start of
++        // 4px to line the "+" up with the tab icons, which was only ever
++        // compensating for the listview insets that pushed the rows off
++        // centre. With those gone both the button and the rows are bare 32px
++        // chips and the viewport centres them on the same axis.
 +        child: Gtk.Box {
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
-+          margin-start: 4;
 +
 +          Gtk.Image {
 +            icon-name: "tab-new-symbolic";
@@ -1670,12 +1710,16 @@ index 0000000..20102bc
 +      // single-click-activate is deliberately left off: GTK documents it as
 +      // "activate rows on single click and select them on hover", and the
 +      // hover half of that would switch tabs just by moving the pointer.
++      // Deliberately *not* styled "navigation-sidebar". That class brings
++      // Adwaita's own row geometry with it -- `.navigation-sidebar > row`
++      // sets `padding: 0 8px` on top of listview insets -- which took the
++      // rail's content to 64px inside a 46px rail. GtkViewport centres what
++      // it cannot fit, so the whole column hung 9px off the left edge with
++      // the icons clipped. Overriding those rules from here did not stick,
++      // so the class is dropped and the rows are styled outright in
++      // style.css instead.
 +      Gtk.ListView list_view {
 +        focusable: false;
-+
-+        styles [
-+          "navigation-sidebar",
-+        ]
 +      }
 +      }
 +    }
