@@ -1422,10 +1422,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..628b803 100644
+index 9c0f115..4402cbf 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,146 @@ label.resize-overlay {
+@@ -181,3 +181,150 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1450,16 +1450,20 @@ index 9c0f115..628b803 100644
 +  background-color: var(--sidebar-bg-color);
 +  color: var(--sidebar-fg-color);
 +
-+  /* Deliberately square and full height, separated from the terminal by a
-+   * hairline on the facing edge. This is libadwaita's own sidebar convention
-+   * -- its stylesheet draws sidebar edges with an inset box-shadow in
-+   * --sidebar-border-color and never rounds a sidebar's outer corners.
-+   * Rounding them made the rail read as a card floating on the terminal
-+   * rather than part of the window. */
++  /* Rounded on the edge that faces the terminal, square on the edge that
++   * meets the window frame, in both the rail and the expanded panel. This is
++   * a deliberate departure from libadwaita's sidebar convention, which keeps
++   * outer corners square and separates with a hairline only; asked for
++   * explicitly, on the grounds that the rail should read as its own surface.
++   *
++   * The hairline stays. As an inset shadow it follows the border radius, so
++   * it curves with the corners instead of cutting across them. */
++  border-radius: 0 12px 12px 0;
 +  box-shadow: inset -1px 0 var(--sidebar-border-color);
 +}
 +
 +.ghostty-tab-sidebar.sidebar-right {
++  border-radius: 12px 0 0 12px;
 +  box-shadow: inset 1px 0 var(--sidebar-border-color);
 +}
 +
