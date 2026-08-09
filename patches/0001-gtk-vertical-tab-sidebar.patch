@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..edcb517
+index 0000000..6b5660b
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1061 @@
+@@ -0,0 +1,1069 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -214,10 +214,10 @@ index 0000000..edcb517
 +        /// times a second, which is what made the slide stutter.
 +        last_inset: c_int = -1,
 +
-+        /// Must start true: the blueprint builds the labels visible, so
-+        /// seeding this false made the first "hide" look like a no-op and
-+        /// they were never hidden at all -- leaving a 98px row clipped into
-+        /// a 46px rail.
++        /// Must start true, matching how the blueprint builds the labels.
++        /// Seeding it false made the first hide compare equal and get
++        /// skipped, so they were never hidden at all -- leaving a 98px row
++        /// clipped into a 46px rail.
 +        last_labels_shown: bool = true,
 +
 +        /// Currently realized rows.
@@ -406,6 +406,13 @@ index 0000000..edcb517
 +        const priv = self.private();
 +        const collapsed = priv.collapsed;
 +
++        // Map the labels for the state we are entering before the slide
++        // starts, not on the animation's first frame. The animation may not
++        // get a frame for a while -- or at all, if the window is not being
++        // drawn -- and until it does the rows would still be asking for the
++        // width of the state we just left.
++        self.applyLabelFade(priv.current_width);
++
 +        self.animateWidth(self.targetWidth());
 +        self.toggleCssClass("collapsed", collapsed);
 +
@@ -430,16 +437,23 @@ index 0000000..edcb517
 +        );
 +    }
 +
-+    /// Fade every label and close button to match the current width. They are
-+    /// only actually hidden once fully transparent -- at rail width the row
-+    /// has no room for them, and leaving them mapped would squeeze the icon.
++    /// Fade every label and close button to match the current width, and map
++    /// them according to whether the sidebar is *meant* to be open.
++    ///
++    /// Opacity follows the animated width so the text fades with the slide.
++    /// Visibility must not: it decides how much horizontal space the row asks
++    /// for, and the animated width is not a reliable statement of how wide
++    /// the rail actually is. Whenever the two disagreed -- an animation that
++    /// never received a frame, a transition retargeted mid-slide -- the rows
++    /// were laid out for the expanded panel while the rail was allocated at
++    /// 46px, so a 217px row got clipped to an empty stripe with its icon
++    /// pushed out of sight. Keying visibility off `collapsed` makes that
++    /// disagreement impossible: the row asks for exactly the state we are in.
 +    fn applyLabelFade(self: *Self, width: f64) void {
 +        const priv = self.private();
 +        const opacity = labelOpacity(width);
 +
-+        // Visibility triggers a relayout, so only touch it when it actually
-+        // flips. Opacity alone is a cheap redraw.
-+        const shown = opacity > 0.01;
++        const shown = !priv.collapsed;
 +        const flipped = shown != priv.last_labels_shown;
 +        priv.last_labels_shown = shown;
 +        const vis: c_int = @intFromBool(shown);
@@ -473,6 +487,23 @@ index 0000000..edcb517
 +        }
 +    }
 +
++    /// Push `width` into the size request, the terminal's inset and the label
++    /// fade. This is the single place the width becomes visible; the
++    /// animation, and every path that bypasses it, all land here.
++    fn applyWidth(self: *Self, width: f64) void {
++        const priv = self.private();
++        priv.current_width = width;
++
++        // setSizeRequest only raises the *minimum*. That is enough because
++        // the content sits in a ScrolledWindow with propagate-natural-width
++        // off, whose natural width is therefore 0 -- so the request is what
++        // decides both, and the rail follows it exactly.
++        self.as(gtk.Widget).setSizeRequest(@intFromFloat(width), -1);
++
++        self.applyInset(width);
++        self.applyLabelFade(width);
++    }
++
 +    /// Animate the sidebar width to `target`, starting from wherever the
 +    /// current animation left off so that a reversal mid-slide is smooth
 +    /// rather than jumping.
@@ -480,74 +511,51 @@ index 0000000..edcb517
 +        const priv = self.private();
 +
 +        const anim = priv.animation orelse {
-+            priv.current_width = target;
-+            self.as(gtk.Widget).setSizeRequest(@intFromFloat(target), -1);
-+            self.applyInset(target);
-+            self.applyLabelFade(target);
++            self.applyWidth(target);
 +            return;
 +        };
 +
-+        anim.as(adw.Animation).skip();
++        // Deliberately no `skip()` here.
++        //
++        // adw_animation_skip() jumps the animation to its *current* value_to
++        // -- the target we are leaving -- and then, because it leaves the
++        // animation FINISHED, a later skip() is a no-op. Calling it before
++        // re-targeting therefore snapped the width to the wrong end of the
++        // slide, and if the new animation then failed to receive a frame the
++        // width stayed there. Measured: after a few hover cycles every
++        // expand left current_width at the rail's 46 and every collapse left
++        // it at the panel's 260 -- exactly inverted -- which is what
++        // rendered an "open" sidebar as a clipped 46px stripe.
++        //
++        // adw_animation_play() already restarts a playing or finished
++        // animation from value_from, so nothing needs skipping first.
 +        anim.setValueFrom(priv.current_width);
 +        anim.setValueTo(target);
 +        anim.as(adw.Animation).play();
 +    }
 +
-+    /// Report the animated width as both minimum and natural.
++    /// The animation has settled: adopt its end value.
 +    ///
-+    /// This is what actually drives the rail's size. `setSizeRequest` only
-+    /// raises the *minimum*, and GtkOverlay allocates an overlay child its
-+    /// *natural* width -- so as long as the content's natural width was
-+    /// larger, the rail rendered at whatever its widest child needed and the
-+    /// animation had no visible effect at all. That is why the sidebar
-+    /// appeared at full width with no labels: the widget was ~200px wide
-+    /// while the animation still believed it was 46, so the labels were
-+    /// faded out for a rail that was never actually narrow.
-+    fn measure(
-+        self: *Self,
-+        orientation: gtk.Orientation,
-+        for_size: c_int,
-+        minimum: ?*c_int,
-+        natural: ?*c_int,
-+        minimum_baseline: ?*c_int,
-+        natural_baseline: ?*c_int,
-+    ) callconv(.c) void {
-+        gtk.Widget.virtual_methods.measure.call(
-+            Class.parent,
-+            self.as(Parent),
-+            orientation,
-+            for_size,
-+            minimum,
-+            natural,
-+            minimum_baseline,
-+            natural_baseline,
-+        );
++    /// `done` also fires when an animation is skipped rather than played out,
++    /// in which case the per-frame callback never walked the width to the
++    /// target. Re-applying it here means the resting state is always the one
++    /// the collapsed flag asks for, however the slide got there.
++    fn animationDone(anim: *adw.Animation, self: *Self) callconv(.c) void {
++        const priv = self.private();
++        self.applyWidth(anim.getValue());
 +
-+        if (orientation != .horizontal) return;
-+
-+        const w: c_int = @intFromFloat(@max(self.private().current_width, 0));
-+        if (minimum) |m| m.* = w;
-+        if (natural) |n| n.* = w;
-+    }
-+
-+    fn animationDone(_: *adw.Animation, self: *Self) callconv(.c) void {
-+        if (self.private().active) return;
-+        self.as(gtk.Widget).setVisible(0);
++        // Hide on `done` rather than trusting the width to reach zero.
++        if (!priv.active) self.as(gtk.Widget).setVisible(0);
 +    }
 +
 +    fn animationValue(value: f64, ud: ?*anyopaque) callconv(.c) void {
 +        const self: *Self = @ptrCast(@alignCast(ud orelse return));
 +        const priv = self.private();
-+        priv.current_width = value;
 +
-+        self.as(gtk.Widget).setSizeRequest(@intFromFloat(value), -1);
++        self.applyWidth(value);
 +
-+        self.applyInset(value);
-+        self.applyLabelFade(value);
-+
-+        // setSizeRequest only sets a *minimum*; the rail's natural width
-+        // would keep it on screen at the end of the slide-out. Hide it once
-+        // the animation has actually reached zero.
++        // The rail's natural width would keep it on screen at the end of the
++        // slide-out. Hide it once the animation has actually reached zero.
 +        if (!priv.active and value < 1) self.as(gtk.Widget).setVisible(0);
 +    }
 +
@@ -950,13 +958,14 @@ index 0000000..edcb517
 +            .pwd_handler = pwd_handler,
 +        }) catch return;
 +
-+        // A row realized mid-animation has to match the fade already in
-+        // progress, not the end state. Set it directly rather than through
-+        // applyLabelFade: that skips visibility unless the shared state has
-+        // just flipped, which would leave this brand-new row showing whatever
-+        // the blueprint built it as.
++        // A row realized mid-slide has to join the fade already in progress,
++        // so its opacity comes from the animated width -- but its visibility,
++        // like every other row's, comes from the collapsed flag. Set both
++        // directly rather than through applyLabelFade: that only touches
++        // visibility when the shared state has just flipped, which would
++        // leave this brand-new row mapped exactly as the blueprint built it.
 +        const opacity = labelOpacity(priv.current_width);
-+        const vis: c_int = @intFromBool(opacity > 0.01);
++        const vis: c_int = @intFromBool(!priv.collapsed);
 +        text_box.as(gtk.Widget).setOpacity(opacity);
 +        close.as(gtk.Widget).setOpacity(opacity);
 +        text_box.as(gtk.Widget).setVisible(vis);
@@ -1081,7 +1090,6 @@ index 0000000..edcb517
 +            });
 +
 +            gobject.Object.virtual_methods.dispose.implement(class, &dispose);
-+            gtk.Widget.virtual_methods.measure.implement(class, &measure);
 +        }
 +
 +        pub const as = C.Class.as;
