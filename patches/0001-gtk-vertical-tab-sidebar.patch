@@ -1682,7 +1682,7 @@ index 0000000..2e80722
 +    };
 +};
 diff --git a/src/apprt/gtk/class/window.zig b/src/apprt/gtk/class/window.zig
-index c01cad6..d352b21 100644
+index c01cad6..5cde843 100644
 --- a/src/apprt/gtk/class/window.zig
 +++ b/src/apprt/gtk/class/window.zig
 @@ -28,6 +28,8 @@ const Surface = @import("surface.zig").Surface;
@@ -1822,7 +1822,29 @@ index c01cad6..d352b21 100644
          // Do our window-protocol specific appearance sync.
          priv.winproto.syncAppearance() catch |err| {
              log.warn("failed to sync winproto appearance error={}", .{err});
-@@ -1011,10 +1090,43 @@ pub const Window = extern struct {
+@@ -980,8 +1059,19 @@ pub const Window = extern struct {
+         }
+ 
+         return switch (config.@"gtk-titlebar-style") {
+-            // If the titlebar style is tabs never show the titlebar.
+-            .tabs => false,
++            // If the titlebar style is tabs never show the titlebar -- the tab
++            // bar *is* the titlebar in that mode, and window.blp puts the
++            // window controls inside it.
++            //
++            // Unless the tabs have moved to the sidebar, in which case there
++            // is no tab bar: `getTabsVisible` returns false for the side
++            // locations, which takes the Gtk.WindowControls down with it and
++            // leaves the window with no close button at all. Fall back to the
++            // header bar, which is where those controls live otherwise.
++            .tabs => switch (config.@"gtk-tabs-location") {
++                .left, .right => config.@"gtk-titlebar",
++                .top, .bottom => false,
++            },
+ 
+             // If the titlebar style is native show the titlebar if configured
+             // to do so.
+@@ -1011,10 +1101,43 @@ pub const Window = extern struct {
          };
      }
  
@@ -1866,7 +1888,7 @@ index c01cad6..d352b21 100644
          switch (config.@"gtk-titlebar-style") {
              .tabs => {
                  // *Conditionally* disable the tab bar when maximized, the titlebar
-@@ -1488,6 +1600,9 @@ pub const Window = extern struct {
+@@ -1488,6 +1611,9 @@ pub const Window = extern struct {
          _: c_int,
          self: *Self,
      ) callconv(.c) void {
@@ -1876,7 +1898,7 @@ index c01cad6..d352b21 100644
          // Get the attached page which must be a Tab object.
          const child = page.getChild();
          const tab = gobject.ext.cast(Tab, child) orelse return;
-@@ -1579,12 +1694,69 @@ pub const Window = extern struct {
+@@ -1579,12 +1705,69 @@ pub const Window = extern struct {
          priv.tab_view.closePage(page);
      }
  
@@ -1946,7 +1968,7 @@ index c01cad6..d352b21 100644
          if (priv.tab_view.getNPages() == 0) {
              // If we have no pages left then we want to close window.
  
-@@ -1839,6 +2011,17 @@ pub const Window = extern struct {
+@@ -1839,6 +2022,17 @@ pub const Window = extern struct {
          self.performBindingAction(.new_window);
      }
  
@@ -1964,7 +1986,7 @@ index c01cad6..d352b21 100644
      fn actionNewTab(
          _: *gio.SimpleAction,
          _: ?*glib.Variant,
-@@ -2061,6 +2244,7 @@ pub const Window = extern struct {
+@@ -2061,6 +2255,7 @@ pub const Window = extern struct {
              gobject.ext.ensureType(SplitTree);
              gobject.ext.ensureType(Surface);
              gobject.ext.ensureType(Tab);
@@ -1972,7 +1994,7 @@ index c01cad6..d352b21 100644
              gtk.Widget.Class.setTemplateFromResource(
                  class.as(gtk.Widget.Class),
                  comptime gresource.blueprint(.{
-@@ -2078,6 +2262,7 @@ pub const Window = extern struct {
+@@ -2078,6 +2273,7 @@ pub const Window = extern struct {
                  properties.@"headerbar-visible".impl,
                  properties.@"quick-terminal".impl,
                  properties.@"tabs-autohide".impl,
@@ -1980,7 +2002,7 @@ index c01cad6..d352b21 100644
                  properties.@"tabs-visible".impl,
                  properties.@"tabs-wide".impl,
                  properties.@"toolbar-style".impl,
-@@ -2090,6 +2275,9 @@ pub const Window = extern struct {
+@@ -2090,6 +2286,9 @@ pub const Window = extern struct {
              class.bindTemplateChildPrivate("tab_view", .{});
              class.bindTemplateChildPrivate("toolbar", .{});
              class.bindTemplateChildPrivate("toast_overlay", .{});
