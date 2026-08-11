@@ -1,7 +1,11 @@
 # Build scratch. The upstream source, toolchain and dependency cache all live
 # outside this repo and are re-derivable; only the patches are irreplaceable.
 /build/
+
+# makepkg's working directories and output, for when it is run in the repo root.
 /src/
+/pkg/
+*.pkg.tar.zst
 *.tar.gz
 *.tar.xz
 *.log

@@ -1,0 +1,75 @@
+name: build
+
+# Builds the package the way a user would: official tarball, patch on top,
+# makepkg. Then looks at the result under Xvfb, because "it compiled" is not
+# evidence that the sidebar still renders.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git curl sudo \
+            blueprint-compiler pandoc-cli \
+            gtk4 libadwaita gtk4-layer-shell harfbuzz fontconfig freetype2 \
+            oniguruma pixman libpng zlib bzip2 libx11 wayland \
+            xorg-server-xvfb xdotool imagemagick python-pillow
+
+      - uses: actions/checkout@v4
+
+      - name: Create build user
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+          chown -R builder:builder .
+
+      - name: Read pkgver
+        run: |
+          ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          test -n "$ver"
+          echo "PKGVER=$ver" >>"$GITHUB_ENV"
+
+      # Arch's repo zig tracks the newest release, which is routinely ahead of
+      # what a tagged Ghostty can be built with -- the PKGBUILD rejects it on
+      # purpose. Take the version the source itself asks for, so a version bump
+      # brings the right toolchain with it.
+      - name: Fetch the Zig the source asks for
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL \
+            "https://raw.githubusercontent.com/ghostty-org/ghostty/v${PKGVER}/build.zig.zon" \
+            | sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p')
+          test -n "$ver"
+          echo "Ghostty v${PKGVER} asks for Zig $ver"
+          curl -fsSL "https://ziglang.org/download/${ver}/zig-x86_64-linux-${ver}.tar.xz" \
+            | tar -xJ -C /opt
+          echo "ZIG=/opt/zig-x86_64-linux-${ver}/zig" >>"$GITHUB_ENV"
+
+      - name: makepkg
+        run: sudo -u builder --preserve-env=ZIG makepkg --nodeps --noconfirm
+
+      - name: Smoke test the built binary
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkgx && chmod 777 /tmp/pkgx
+          tar -xf ghostty-vertical-tabs-*.pkg.tar.zst -C /tmp/pkgx
+          /tmp/pkgx/usr/bin/ghostty --version
+          sudo -u builder ./ci/smoke-test.sh /tmp/pkgx/usr/bin/ghostty
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: package
+          path: "*.pkg.tar.zst"
+          if-no-files-found: warn

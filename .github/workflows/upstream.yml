@@ -1,0 +1,128 @@
+name: upstream
+
+# Watches for new Ghostty releases and answers one question: does the patch
+# still apply?
+#
+# Deliberately split from build.yml, and deliberately cheap. Applying a patch
+# to a tarball takes seconds and has essentially no way to fail spuriously, so
+# when this job goes red it means something real. Piling the build in here as
+# well would put a slow, flakier job in front of that signal.
+#
+# What this cannot tell you is the other failure mode: a patch that applies and
+# compiles but is subtly wrong because libadwaita changed underneath it. Only
+# ci/smoke-test.sh looks for that, and only build.yml runs it. Neither of them
+# is a substitute for the other.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tags, not releases. ghostty-org/ghostty does not publish a "latest
+      # release" -- /releases/latest is a 404 -- so the tag list is the only
+      # thing that says what the newest version is.
+      #
+      # GitHub returns tags in roughly chronological order, which is not the
+      # same as version order, so they are filtered to plain vX.Y.Z (dropping
+      # the rolling `tip` tag and any prereleases) and sorted properly.
+      - name: Find the newest upstream tag
+        id: upstream
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/ghostty-org/ghostty/tags?per_page=100" \
+            | jq -r '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)
+          test -n "$latest"
+          ours=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          echo "latest=$latest" >>"$GITHUB_OUTPUT"
+          echo "ours=v$ours"   >>"$GITHUB_OUTPUT"
+          echo "Upstream: $latest   Packaged: v$ours"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Test-apply the patches
+        id: apply
+        run: |
+          set -euo pipefail
+          tag="${{ steps.upstream.outputs.latest }}"
+          curl -fsSL "https://github.com/ghostty-org/ghostty/archive/${tag}/ghostty.tar.gz" \
+            | tar -xz -C /tmp
+          dir=$(echo /tmp/ghostty-*/)
+          echo "Applying to $dir"
+
+          failed=""
+          for p in patches/*.patch; do
+            if patch -p1 -d "$dir" --dry-run -i "$PWD/$p" >/tmp/apply.log 2>&1; then
+              echo "ok       $p"
+            else
+              echo "CONFLICT $p"
+              cat /tmp/apply.log
+              failed="$failed $p"
+            fi
+          done
+
+          if [ -n "$failed" ]; then
+            {
+              echo "conflict=true"
+              echo "failed=$failed"
+            } >>"$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "conflict=false" >>"$GITHUB_OUTPUT"
+
+      - name: Open an issue on conflict
+        if: failure() && steps.apply.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = "${{ steps.upstream.outputs.latest }}";
+            const ours = "${{ steps.upstream.outputs.ours }}";
+            const title = `Patch conflicts with upstream ${tag}`;
+
+            // One issue per upstream tag, not one per week.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "upstream",
+            });
+            if (existing.data.some(i => i.title === title)) {
+              core.info(`already tracked: ${title}`);
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ["upstream"],
+              body: [
+                `Ghostty **${tag}** is out. The patch set no longer applies`,
+                `cleanly (we package ${ours}).`,
+                ``,
+                `This is the failure mode no automation fixes: upstream edited`,
+                `the same lines. A human has to rebase the patch.`,
+                ``,
+                `[Run log](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              ].join("\n"),
+            });
+
+      - name: Note a new release that still applies
+        if: success() && steps.upstream.outputs.latest != steps.upstream.outputs.ours
+        run: |
+          echo "::notice::${{ steps.upstream.outputs.latest }} is available and the patch still applies."
+          echo "Bump pkgver in PKGBUILD, refresh sha256sums with updpkgsums, and let build.yml prove it."

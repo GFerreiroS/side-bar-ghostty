@@ -119,6 +119,50 @@ the viewport/scrollbar allocation adds it, not the margins.
    `^    pub fn ` finds only `as` and will mislead you into thinking they are
    unusable.
 
+## Packaging (added 2026-08-11)
+
+`PKGBUILD` and `.github/workflows/` now exist, so the repo finally matches the
+three deliverables `CLAUDE.md` asks for. Verified by actually running them, not
+by reading them.
+
+- **A clean `makepkg` succeeds**, from the official tarball, ReleaseFast, with
+  `check()` running upstream's suite. The resulting package was extracted and
+  the binary launched under Xvfb: the sidebar renders, with branch and
+  subtitle. `ghostty --version` reports `1.3.1-vertical-tabs1`.
+- **makepkg will not take a local source in a subdirectory.** Both
+  `patches/foo.patch` and `foo.patch::patches/foo.patch` fail with "was not
+  found in the build directory" — the man page means it literally. The
+  workaround is the root symlink `0001-…patch -> patches/0001-…patch`, which
+  keeps `patches/` canonical and still checksums properly.
+- **Two toolchain guards live in the PKGBUILD, and both are needed today:**
+  - Arch's repo zig is 0.16, and v1.3.1 predates upstream's 0.16 port. The
+    build fails fast with instructions rather than deep inside a compile.
+    Override with `ZIG=/path/to/zig-0.15.2/zig makepkg`.
+  - Zig cannot link against Arch's libc at all right now: `crt1.o` carries a
+    `GNU_SFRAME` section with `R_X86_64_PC64` relocations Zig's ELF linker does
+    not implement. `pub fn main() void {}` with `-lc` fails identically, so
+    this is nothing to do with the patch. `prepare()` probes for it and, only
+    if it fails, strips the section into a private CRT dir and points Zig at
+    it with a `--libc` file. It disappears the moment either side fixes this.
+
+    (`objcopy` takes one input file, not a glob — the first version of this
+    silently printed its usage and failed `prepare()`.)
+- **`ci/smoke-test.sh` is the guard against silent API drift**, which is the
+  failure mode nothing else catches. It launches twice at two configured rail
+  widths and asserts the *difference* — absolute pixel positions depend on the
+  client-side decoration, the delta does not, and asserting on it also proves
+  the widget still reads its configuration. Negative control: run it against
+  `/usr/bin/ghostty` (unpatched) and it fails, as it must.
+- **Upstream publishes no GitHub Release** — `/releases/latest` is a 404 — so
+  the watcher reads the tag list, filters to `vX.Y.Z` (dropping the rolling
+  `tip`) and sorts with `sort -V`.
+
+**Forward-compatibility, measured 2026-08-11:** the patch applies cleanly to
+`v1.3.0` *and* to `tip`. It conflicts with `v1.2.0` and `v1.0.0`, which is how
+the watcher was confirmed to actually detect conflicts. Applying is not
+compiling and not behaving — `tip` was not built — but the patch regions have
+stayed stable across a lot of upstream churn.
+
 ## Scope warning worth revisiting
 
 Twelve options in `src/config/Config.zig` widens the patch's conflict surface
