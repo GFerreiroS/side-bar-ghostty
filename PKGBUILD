@@ -46,7 +46,6 @@ makedepends=(blueprint-compiler
              zig)
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
-options=(!lto)
 
 _archive="$_pkgname-$pkgver"
 
@@ -179,7 +178,17 @@ prepare() {
 		patch -p1 -i "$p"
 	done
 
-	ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache/" ./nix/build-support/fetch-zig-cache.sh
+	# fetch-zig-cache.sh calls a bare `zig`, so $ZIG is not enough on its own:
+	# with a toolchain that is not on PATH, the very first entry in
+	# build.zig.zon.txt (a git+https dep) fails and the script exits, reporting
+	# only "Failed to fetch" because it discards stderr. Give it a PATH entry
+	# pointing at whichever zig we settled on.
+	mkdir -p "$srcdir/zig-bin"
+	ln -sf "$(command -v "$_zig" || readlink -f "$_zig")" "$srcdir/zig-bin/zig"
+
+	PATH="$srcdir/zig-bin:$PATH" \
+		ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache/" \
+		./nix/build-support/fetch-zig-cache.sh
 }
 
 build() {

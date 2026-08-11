@@ -156,6 +156,22 @@ by reading them.
 - **Upstream publishes no GitHub Release** — `/releases/latest` is a 404 — so
   the watcher reads the tag list, filters to `vX.Y.Z` (dropping the rolling
   `tip`) and sorts with `sort -V`.
+- **`$ZIG` alone is not enough.** `nix/build-support/fetch-zig-cache.sh` calls
+  a *bare* `zig`, and the first line of `build.zig.zon.txt` is a `git+https`
+  dep, so with no zig on PATH the very first fetch fails — reporting only
+  "Failed to fetch", because the script discards stderr. `prepare()` now
+  symlinks the chosen toolchain into `$srcdir/zig-bin` and puts that on PATH.
+
+  This was caught by CI, not locally: the first local `makepkg` passed only
+  because `build/bin` happened to be on PATH supplying *both* `zig` and
+  `blueprint-compiler`. Re-test packaging with `PATH` containing
+  blueprint-compiler but **not** zig, which is what the container looks like.
+- Re-running `makepkg` over an already-patched `src/` fails confusingly
+  ("which already exists! Assume -R?"). Normal makepkg behaviour, not ours —
+  use `makepkg -C` or a clean directory.
+- The artifact glob `ghostty-vertical-tabs-*.pkg.tar.zst` also matches the
+  `-debug` package, and `tar -xf` then treats the second match as a member
+  name. Anchor on the version digit: `ghostty-vertical-tabs-[0-9]*`.
 
 **Forward-compatibility, measured 2026-08-11:** the patch applies cleanly to
 `v1.3.0` *and* to `tip`. It conflicts with `v1.2.0` and `v1.0.0`, which is how

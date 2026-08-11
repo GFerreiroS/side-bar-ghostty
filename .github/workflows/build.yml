@@ -63,7 +63,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/pkgx && chmod 777 /tmp/pkgx
-          tar -xf ghostty-vertical-tabs-*.pkg.tar.zst -C /tmp/pkgx
+          # `ghostty-vertical-tabs-*` also matches the -debug package, and tar
+          # would take the second match as a member name to extract from the
+          # first. Anchor on the version digit instead.
+          tar -xf ghostty-vertical-tabs-[0-9]*.pkg.tar.zst -C /tmp/pkgx
           /tmp/pkgx/usr/bin/ghostty --version
           sudo -u builder ./ci/smoke-test.sh /tmp/pkgx/usr/bin/ghostty
 
