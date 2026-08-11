@@ -24,14 +24,15 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..f44e341
+index 0000000..2e80722
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1187 @@
+@@ -0,0 +1,1653 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
 +const gdk = @import("gdk");
++const gio = @import("gio");
 +const glib = @import("glib");
 +const gobject = @import("gobject");
 +const gtk = @import("gtk");
@@ -40,6 +41,8 @@ index 0000000..f44e341
 +const gresource = @import("../build/gresource.zig");
 +const Common = @import("../class.zig").Common;
 +const Settings = @import("../tab_sidebar_settings.zig");
++const git = @import("../tab_sidebar_git.zig");
++const prefs = @import("../tab_sidebar_prefs.zig");
 +const Application = @import("application.zig").Application;
 +const Config = @import("config.zig").Config;
 +const Surface = @import("surface.zig").Surface;
@@ -106,11 +109,66 @@ index 0000000..f44e341
 +        icon: *gtk.Image,
 +        close: *gtk.Button,
 +
-+        /// The surface we're watching for directory changes, and the handler
-+        /// watching it. Without this a tab keeps its old folder name forever
-+        /// after you cd.
++        /// Second line: the branch, then whatever the subtitle setting asks
++        /// for. Both live in one box so the line disappears whole when
++        /// neither has anything to say.
++        subtitle_box: *gtk.Box,
++        branch_label: *gtk.Label,
++        subtitle_label: *gtk.Label,
++
++        /// Status icons, shown between the text and the close button.
++        indicator_box: *gtk.Box,
++        bell_icon: *gtk.Image,
++        readonly_icon: *gtk.Image,
++
++        /// Whether this row has an indicator to show *at all*. Actually
++        /// showing it needs the sidebar expanded as well: the icons sit in
++        /// the row box, and on the rail that box has to measure exactly one
++        /// chip across or the rail grows and creeps over the terminal.
++        wants_indicators: bool = false,
++
++        /// The surface we're watching, and every handler watching it.
++        /// Without the pwd one a tab keeps its old folder name forever after
++        /// you cd; the rest keep the second line and the indicators honest.
 +        surface: ?*Surface = null,
-+        pwd_handler: c_ulong = 0,
++        handlers: [4]c_ulong = @splat(0),
++
++        /// The repository's `HEAD` for this tab's directory, the monitor
++        /// watching it, and the branch last read out of it.
++        ///
++        /// A monitor rather than a poll: `HEAD` is rewritten by every
++        /// checkout, so the kernel already knows the answer changed and there
++        /// is nothing to poll for in between.
++        head_path: ?[:0]u8 = null,
++        head_monitor: ?*gio.FileMonitor = null,
++        head_handler: c_ulong = 0,
++        branch: ?[]u8 = null,
++
++        /// Free everything the row owns. The widgets are not ours -- GTK owns
++        /// the recycled row -- but the strings and the monitor are.
++        fn deinit(self: *Row, alloc: std.mem.Allocator) void {
++            if (self.surface) |s| {
++                for (self.handlers) |h| {
++                    if (h != 0) gobject.signalHandlerDisconnect(s.as(gobject.Object), h);
++                }
++            }
++            self.surface = null;
++            self.handlers = @splat(0);
++
++            if (self.head_monitor) |m| {
++                if (self.head_handler != 0) {
++                    gobject.signalHandlerDisconnect(m.as(gobject.Object), self.head_handler);
++                }
++                _ = m.cancel();
++                m.unref();
++                self.head_monitor = null;
++                self.head_handler = 0;
++            }
++            if (self.head_path) |p| alloc.free(p);
++            if (self.branch) |b| alloc.free(b);
++            self.head_path = null;
++            self.branch = null;
++        }
 +    };
 +
 +    const key_row_box = "ghostty-row-box";
@@ -118,6 +176,12 @@ index 0000000..f44e341
 +    const key_text_box = "ghostty-text-box";
 +    const key_icon_image = "ghostty-icon-image";
 +    const key_close_button = "ghostty-close-button";
++    const key_subtitle_box = "ghostty-subtitle-box";
++    const key_branch_label = "ghostty-branch-label";
++    const key_subtitle_label = "ghostty-subtitle-label";
++    const key_indicator_box = "ghostty-indicator-box";
++    const key_bell_icon = "ghostty-bell-icon";
++    const key_readonly_icon = "ghostty-readonly-icon";
 +    const key_page = "ghostty-page";
 +
 +    pub const properties = struct {
@@ -181,6 +245,12 @@ index 0000000..f44e341
 +        /// Whether the sidebar is wanted at all. False with a single tab, in
 +        /// which case the width animates to zero rather than vanishing.
 +        active: bool = false,
++
++        /// Stylesheet generated from `settings`, holding everything CSS has
++        /// to own: the corner radius, and the margins that centre the icon
++        /// chips. Added to the display rather than the widget, because GTK4
++        /// has no per-widget providers.
++        css_provider: ?*gtk.CssProvider = null,
 +
 +        /// Pending collapse timer, running while the pointer is away.
 +        hover_timer: ?c_uint = null,
@@ -287,22 +357,69 @@ index 0000000..f44e341
 +            .{ .detail = "active" },
 +        );
 +
++        // The sidebar's own action group, so its menu can reach a dialog the
++        // window knows nothing about. Actions resolve up the widget tree, so
++        // "sidebar.preferences" from the menu inside us lands here.
++        const actions = gio.SimpleActionGroup.new();
++        const preferences = gio.SimpleAction.new("preferences", null);
++        _ = gio.SimpleAction.signals.activate.connect(
++            preferences,
++            *Self,
++            &openPreferences,
++            self,
++            .{},
++        );
++        actions.as(gio.ActionMap).addAction(preferences.as(gio.Action));
++        preferences.unref();
++        self.as(gtk.Widget).insertActionGroup("sidebar", actions.as(gio.ActionGroup));
++        actions.unref();
++
 +        self.as(gtk.Widget).setVisible(0);
 +        self.applyCollapsed();
++    }
++
++    fn openPreferences(
++        _: *gio.SimpleAction,
++        _: ?*glib.Variant,
++        self: *Self,
++    ) callconv(.c) void {
++        prefs.present(
++            Application.default().allocator(),
++            self.as(gtk.Widget),
++            self.private().settings,
++            &applyFromPreferences,
++            self,
++        );
++    }
++
++    /// The dialog changed something. It has already normalized and saved; all
++    /// that is left is to look like it.
++    fn applyFromPreferences(ctx: ?*anyopaque, settings: Settings) void {
++        const self: *Self = @ptrCast(@alignCast(ctx orelse return));
++        self.setSettings(settings);
 +    }
 +
 +    fn dispose(self: *Self) callconv(.c) void {
 +        const priv = self.private();
 +
 +        self.cancelHoverTimer();
-+        for (priv.rows.items) |row| {
-+            if (row.surface) |s| {
-+                if (row.pwd_handler != 0) {
-+                    gobject.signalHandlerDisconnect(s.as(gobject.Object), row.pwd_handler);
-+                }
++        const alloc = Application.default().allocator();
++        for (priv.rows.items) |*row| row.deinit(alloc);
++        priv.rows.deinit(alloc);
++
++        // The provider was added to the display, which outlives this widget,
++        // so it has to be taken back off or a closed window keeps styling
++        // every window that is still open.
++        if (priv.css_provider) |provider| {
++            if (gdk.Display.getDefault()) |display| {
++                gtk.StyleContext.removeProviderForDisplay(
++                    display,
++                    provider.as(gtk.StyleProvider),
++                );
 +            }
++            provider.unref();
++            priv.css_provider = null;
 +        }
-+        priv.rows.deinit(Application.default().allocator());
 +
 +        if (priv.config) |config| {
 +            config.unref();
@@ -417,11 +534,122 @@ index 0000000..f44e341
 +            row.icon.as(gtk.Widget).setSizeRequest(chip, chip);
 +        }
 +
++        self.updateCss();
 +        self.applyCollapsed();
++
++        // `git_branch` decides whether a row holds a file monitor at all, so
++        // toggling it has to add or drop the watches, not just hide a label.
++        for (priv.rows.items) |*row| self.watchBranch(row);
 +
 +        // Tooltips differ between modes, so they are rebuilt rather than left
 +        // describing the mode we just left.
 +        self.refreshNames();
++        self.refreshContent();
++    }
++
++    /// Regenerate the sidebar's stylesheet from the current settings.
++    ///
++    /// Sizes that GTK draws rather than measures -- the corner radius, and
++    /// the margins that turn a full-width row into a centred chip -- can only
++    /// be expressed in CSS, and `style.css` is a static resource compiled
++    /// into the binary. So the configurable half of it is re-emitted here and
++    /// loaded over the top.
++    ///
++    /// Priority sits one above the application sheet so these win, and below
++    /// `STYLE_PROVIDER_PRIORITY_USER` so a user's `gtk-custom-css` still
++    /// beats us -- they asked for that by hand; we are only a default.
++    fn updateCss(self: *Self) void {
++        const priv = self.private();
++        const alloc = Application.default().allocator();
++
++        var buf: std.ArrayListUnmanaged(u8) = .empty;
++        defer buf.deinit(alloc);
++
++        self.writeCss(buf.writer(alloc)) catch |err| {
++            log.warn("unable to build sidebar css error={}", .{err});
++            return;
++        };
++
++        const provider = priv.css_provider orelse provider: {
++            const display = gdk.Display.getDefault() orelse {
++                log.warn("no display; sidebar css not applied", .{});
++                return;
++            };
++
++            const p = gtk.CssProvider.new();
++            gtk.StyleContext.addProviderForDisplay(
++                display,
++                p.as(gtk.StyleProvider),
++                gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 4,
++            );
++            priv.css_provider = p;
++            break :provider p;
++        };
++
++        const bytes = glib.Bytes.new(buf.items.ptr, buf.items.len);
++        defer bytes.unref();
++
++        // Replaces whatever this provider held before, so nothing accumulates
++        // across reloads.
++        provider.loadFromBytes(bytes);
++    }
++
++    fn writeCss(
++        self: *Self,
++        writer: anytype,
++    ) @TypeOf(writer).Error!void {
++        const s = &self.private().settings;
++
++        // The terminal-facing edge is the rounded one, and which edge that is
++        // depends on the side the sidebar sits on.
++        try writer.print(
++            \\.ghostty-tab-sidebar {{
++            \\  border-radius: 0 {[r]d}px {[r]d}px 0;
++            \\}}
++            \\.ghostty-tab-sidebar.sidebar-right {{
++            \\  border-radius: {[r]d}px 0 0 {[r]d}px;
++            \\}}
++            \\
++        , .{ .r = s.corner_radius });
++
++        // The chip. A collapsed row fills the rail, so its side margins are
++        // what decide the chip's width -- and the "+" needs a smaller margin
++        // to land on the same axis, because a flat button carries 6px of
++        // Adwaita padding that our `padding: 0` never wins against. The two
++        // are a derived pair; see `Settings.newButtonMargin`.
++        try writer.print(
++            \\.ghostty-tab-sidebar.collapsed listview > row {{
++            \\  margin: 2px {[m]d}px;
++            \\  min-height: {[chip]d}px;
++            \\}}
++            \\.ghostty-tab-sidebar button.flat {{
++            \\  margin: 6px {[bm]d}px 2px;
++            \\  min-height: {[chip]d}px;
++            \\}}
++            \\
++        , .{
++            .m = s.iconMargin(),
++            .bm = s.newButtonMargin(),
++            .chip = s.icon_size,
++        });
++
++        // The hairline along the terminal-facing edge. Dropping it means
++        // restating every box-shadow rule rather than unsetting one, because
++        // the expanded state packs the hairline and the drop shadow into a
++        // single property.
++        if (!s.border) {
++            try writer.writeAll(
++                \\.ghostty-tab-sidebar,
++                \\.ghostty-tab-sidebar.sidebar-right {
++                \\  box-shadow: none;
++                \\}
++                \\.ghostty-tab-sidebar:not(.collapsed),
++                \\.ghostty-tab-sidebar.sidebar-right:not(.collapsed) {
++                \\  box-shadow: 0 0 12px 0 var(--sidebar-shade-color);
++                \\}
++                \\
++            );
++        }
 +    }
 +
 +    fn setCollapsed(self: *Self, collapsed: bool) void {
@@ -501,14 +729,16 @@ index 0000000..f44e341
 +        priv.last_labels_shown = shown;
 +        const vis: c_int = @intFromBool(shown);
 +
-+        for (priv.rows.items) |row| {
++        for (priv.rows.items) |*row| {
 +            const text = row.text_box.as(gtk.Widget);
 +            const close = row.close.as(gtk.Widget);
 +            text.setOpacity(opacity);
 +            close.setOpacity(opacity);
++            row.indicator_box.as(gtk.Widget).setOpacity(opacity);
 +            if (flipped) {
 +                text.setVisible(vis);
 +                close.setVisible(vis);
++                self.applyIndicatorVisibility(row);
 +            }
 +        }
 +
@@ -903,7 +1133,13 @@ index 0000000..f44e341
 +
 +        const short = tailComponents(p, depth);
 +
-+        const label_text: [:0]const u8 = if (duplicate_path) blk: {
++        // Two tabs in one directory are told apart by their titles. Unless
++        // the subtitle line is already showing that title, in which case
++        // appending it here would print it twice on one row.
++        const disambiguate = duplicate_path and
++            self.private().settings.subtitle != .title;
++
++        const label_text: [:0]const u8 = if (disambiguate) blk: {
 +            const title = pageTitle(row.page) orelse
 +                break :blk alloc.dupeZ(u8, short) catch return;
 +            break :blk std.fmt.allocPrintSentinel(
@@ -934,17 +1170,172 @@ index 0000000..f44e341
 +            return;
 +        }
 +
-+        const tip = std.fmt.allocPrintSentinel(
-+            alloc,
-+            "{s}\n{s}",
-+            .{ label_text, p },
-+            0,
-+        ) catch {
++        // The rail tooltip stands in for the whole expanded row, branch
++        // included -- it is the only way any of it can be read in this mode.
++        const tip = if (row.branch) |b|
++            std.fmt.allocPrintSentinel(alloc, "{s}\n⎇ {s}\n{s}", .{ label_text, b, p }, 0)
++        else
++            std.fmt.allocPrintSentinel(alloc, "{s}\n{s}", .{ label_text, p }, 0);
++
++        const text = tip catch {
 +            row.box.as(gtk.Widget).setTooltipText(p);
 +            return;
 +        };
-+        defer alloc.free(tip);
-+        row.box.as(gtk.Widget).setTooltipText(tip);
++        defer alloc.free(text);
++        row.box.as(gtk.Widget).setTooltipText(text);
++    }
++
++    //---------------------------------------------------------------
++    // Row content: branch, subtitle, indicators
++
++    /// Point a row at the `HEAD` governing its working directory and start
++    /// watching it, replacing whatever it was watching before.
++    ///
++    /// Called on bind and again whenever the tab's directory changes, because
++    /// a `cd` can move a tab between repositories -- or out of one entirely.
++    fn watchBranch(self: *Self, row: *Row) void {
++        const alloc = Application.default().allocator();
++
++        // Tear down the old watch first: the row may have just left the
++        // repository it was in, in which case there is nothing to set up.
++        if (row.head_monitor) |m| {
++            if (row.head_handler != 0) {
++                gobject.signalHandlerDisconnect(m.as(gobject.Object), row.head_handler);
++                row.head_handler = 0;
++            }
++            _ = m.cancel();
++            m.unref();
++            row.head_monitor = null;
++        }
++        if (row.head_path) |p| {
++            alloc.free(p);
++            row.head_path = null;
++        }
++        if (row.branch) |b| {
++            alloc.free(b);
++            row.branch = null;
++        }
++
++        if (!self.private().settings.git_branch) return;
++
++        const pwd = pagePwd(row.page) orelse return;
++        const head = git.headPath(alloc, pwd) orelse return;
++        row.head_path = head;
++        row.branch = git.readBranch(alloc, head);
++
++        // Watch the file, not the directory: `HEAD` is what a checkout
++        // rewrites, and a repository's `.git` is otherwise busy enough that
++        // watching it would wake us for every loose object.
++        const file = gio.File.newForPath(head);
++        defer file.unref();
++
++        var err: ?*glib.Error = null;
++        const monitor = file.monitorFile(.{}, null, &err) orelse {
++            defer if (err) |e| e.free();
++            log.debug("unable to watch {s}", .{head});
++            return;
++        };
++        row.head_monitor = monitor;
++        row.head_handler = gio.FileMonitor.signals.changed.connect(
++            monitor,
++            *Self,
++            &headChanged,
++            self,
++            .{},
++        );
++    }
++
++    fn headChanged(
++        monitor: *gio.FileMonitor,
++        _: *gio.File,
++        _: ?*gio.File,
++        _: gio.FileMonitorEvent,
++        self: *Self,
++    ) callconv(.c) void {
++        const priv = self.private();
++        const alloc = Application.default().allocator();
++
++        for (priv.rows.items) |*row| {
++            if (row.head_monitor != monitor) continue;
++            const head = row.head_path orelse continue;
++
++            if (row.branch) |b| alloc.free(b);
++            row.branch = git.readBranch(alloc, head);
++            self.applyRowContent(row);
++
++            // In rail mode the branch lives in the tooltip, which names
++            // rather than content owns -- so a checkout has to go through
++            // there too. Rare enough (a checkout, not a keystroke) that the
++            // full recompute costs nothing worth avoiding.
++            if (priv.settings.mode == .rail) self.refreshNames();
++            break;
++        }
++    }
++
++    /// Fill in the second line and the indicators for one row.
++    fn applyRowContent(self: *Self, row: *Row) void {
++        const s = &self.private().settings;
++
++        // Branch.
++        const show_branch = s.git_branch and row.branch != null;
++        if (row.branch) |b| {
++            const alloc = Application.default().allocator();
++            const text = std.fmt.allocPrintSentinel(alloc, "⎇ {s}", .{b}, 0) catch null;
++            if (text) |t| {
++                defer alloc.free(t);
++                row.branch_label.setText(t);
++            }
++        }
++        row.branch_label.as(gtk.Widget).setVisible(@intFromBool(show_branch));
++
++        // Subtitle.
++        const subtitle: ?[:0]const u8 = switch (s.subtitle) {
++            .none => null,
++            .title => pageTitle(row.page),
++            .path => pagePwd(row.page),
++        };
++        if (subtitle) |t| row.subtitle_label.setText(t);
++        const show_subtitle = subtitle != null and subtitle.?.len > 0;
++        row.subtitle_label.as(gtk.Widget).setVisible(@intFromBool(show_subtitle));
++
++        // The line as a whole disappears when neither half has anything, so
++        // an unconfigured row is a single line of exactly its old height.
++        row.subtitle_box.as(gtk.Widget).setVisible(
++            @intFromBool(show_branch or show_subtitle),
++        );
++
++        // Indicators.
++        const surface = row.surface;
++        const bell = s.indicators and surface != null and surface.?.getBellRinging();
++        const readonly = s.indicators and surface != null and surface.?.getReadonly();
++        row.bell_icon.as(gtk.Widget).setVisible(@intFromBool(bell));
++        row.readonly_icon.as(gtk.Widget).setVisible(@intFromBool(readonly));
++        row.wants_indicators = bell or readonly;
++        self.applyIndicatorVisibility(row);
++
++        // The indicator icons ride in the row's text area, which is hidden on
++        // the rail -- and the rail is exactly where an unattended tab ringing
++        // its bell most needs to say so. So the state also goes on the row as
++        // a CSS class, which tints the tab icon itself and survives the
++        // collapse.
++        const widget = row.box.as(gtk.Widget);
++        if (bell) {
++            widget.addCssClass("ghostty-tab-attention");
++        } else {
++            widget.removeCssClass("ghostty-tab-attention");
++        }
++    }
++
++    /// Indicators are only ever shown expanded; see `Row.wants_indicators`.
++    fn applyIndicatorVisibility(self: *Self, row: *const Row) void {
++        row.indicator_box.as(gtk.Widget).setVisible(
++            @intFromBool(row.wants_indicators and !self.private().collapsed),
++        );
++    }
++
++    /// Re-fill every realized row.
++    fn refreshContent(self: *Self) void {
++        for (self.private().rows.items) |*row| self.applyRowContent(row);
 +    }
 +
 +    fn pageIndex(tab_view: *adw.TabView, page: *adw.TabPage) ?usize {
@@ -974,11 +1365,16 @@ index 0000000..f44e341
 +        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
 +        const chip: c_int = @intCast(self.private().settings.icon_size);
 +        icon.as(gtk.Widget).setSizeRequest(chip, chip);
++        // Named so the bell can tint this icon and nothing else in the row --
++        // not the indicators, not the close button's glyph.
++        icon.as(gtk.Widget).addCssClass("ghostty-tab-icon");
 +        box.append(icon.as(gtk.Widget));
 +
-+        // The title sits in a vertical box with room for a second line. That
-+        // slot is unused today; it's where per-tab git branch would go
-+        // without having to relayout the row.
++        // The title sits in a vertical box with a second line beneath it for
++        // the branch and the subtitle. The second line is built whether or
++        // not it is wanted, and hidden when it has nothing to show -- so
++        // turning the setting on costs a visibility change rather than a
++        // rebuild of every realized row.
 +        const text_box = gtk.Box.new(.vertical, 0);
 +        text_box.as(gtk.Widget).setHexpand(1);
 +        const title = gtk.Label.new(null);
@@ -986,7 +1382,36 @@ index 0000000..f44e341
 +        title.setEllipsize(.end);
 +        title.setSingleLineMode(1);
 +        text_box.append(title.as(gtk.Widget));
++
++        const subtitle_box = gtk.Box.new(.horizontal, 6);
++        const branch_label = gtk.Label.new(null);
++        branch_label.setXalign(0);
++        branch_label.setEllipsize(.end);
++        branch_label.setSingleLineMode(1);
++        branch_label.as(gtk.Widget).addCssClass("ghostty-tab-branch");
++        subtitle_box.append(branch_label.as(gtk.Widget));
++
++        const subtitle_label = gtk.Label.new(null);
++        subtitle_label.setXalign(0);
++        subtitle_label.setEllipsize(.end);
++        subtitle_label.setSingleLineMode(1);
++        subtitle_label.as(gtk.Widget).setHexpand(1);
++        subtitle_label.as(gtk.Widget).addCssClass("ghostty-tab-subtitle");
++        subtitle_box.append(subtitle_label.as(gtk.Widget));
++
++        text_box.append(subtitle_box.as(gtk.Widget));
 +        box.append(text_box.as(gtk.Widget));
++
++        // Status icons. Individually shown, so a ringing bell does not also
++        // reserve room for a padlock that is not there.
++        const indicator_box = gtk.Box.new(.horizontal, 2);
++        const bell_icon = gtk.Image.newFromIconName("bell-outline-symbolic");
++        bell_icon.as(gtk.Widget).setTooltipText("Bell");
++        indicator_box.append(bell_icon.as(gtk.Widget));
++        const readonly_icon = gtk.Image.newFromIconName("changes-prevent-symbolic");
++        readonly_icon.as(gtk.Widget).setTooltipText("Read-only");
++        indicator_box.append(readonly_icon.as(gtk.Widget));
++        box.append(indicator_box.as(gtk.Widget));
 +
 +        const close = gtk.Button.newFromIconName("window-close-symbolic");
 +        close.as(gtk.Widget).addCssClass("flat");
@@ -1014,6 +1439,12 @@ index 0000000..f44e341
 +        gobject.Object.setData(obj, key_text_box, text_box);
 +        gobject.Object.setData(obj, key_icon_image, icon);
 +        gobject.Object.setData(obj, key_close_button, close);
++        gobject.Object.setData(obj, key_subtitle_box, subtitle_box);
++        gobject.Object.setData(obj, key_branch_label, branch_label);
++        gobject.Object.setData(obj, key_subtitle_label, subtitle_label);
++        gobject.Object.setData(obj, key_indicator_box, indicator_box);
++        gobject.Object.setData(obj, key_bell_icon, bell_icon);
++        gobject.Object.setData(obj, key_readonly_icon, readonly_icon);
 +
 +        list_item.setChild(box.as(gtk.Widget));
 +    }
@@ -1044,22 +1475,45 @@ index 0000000..f44e341
 +        const close: *gtk.Button = @ptrCast(@alignCast(
 +            gobject.Object.getData(obj, key_close_button) orelse return,
 +        ));
++        const subtitle_box: *gtk.Box = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_subtitle_box) orelse return,
++        ));
++        const branch_label: *gtk.Label = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_branch_label) orelse return,
++        ));
++        const subtitle_label: *gtk.Label = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_subtitle_label) orelse return,
++        ));
++        const indicator_box: *gtk.Box = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_indicator_box) orelse return,
++        ));
++        const bell_icon: *gtk.Image = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_bell_icon) orelse return,
++        ));
++        const readonly_icon: *gtk.Image = @ptrCast(@alignCast(
++            gobject.Object.getData(obj, key_readonly_icon) orelse return,
++        ));
 +
 +        gobject.Object.setData(close.as(gobject.Object), key_page, page);
 +        gobject.Object.setData(box.as(gobject.Object), key_page, page);
 +
-+        // Watch this tab's directory so the label follows a cd.
++        // Watch this tab's surface. `pwd` moves the label and the branch,
++        // `title` the subtitle, and the last two the indicators. All four go
++        // through the same handler: every one of them can change what the row
++        // shows, and none of them fires often enough to be worth splitting.
 +        var surface: ?*Surface = null;
-+        var pwd_handler: c_ulong = 0;
++        var handlers: [4]c_ulong = @splat(0);
 +        if (pageSurface(page)) |s| {
 +            surface = s;
-+            pwd_handler = gobject.Object.signals.notify.connect(
-+                s,
-+                *Self,
-+                &surfacePwdChanged,
-+                self,
-+                .{ .detail = "pwd" },
-+            );
++            inline for (.{ "pwd", "title", "bell-ringing", "readonly" }, 0..) |detail, i| {
++                handlers[i] = gobject.Object.signals.notify.connect(
++                    s,
++                    *Self,
++                    &surfaceChanged,
++                    self,
++                    .{ .detail = detail },
++                );
++            }
 +        }
 +
 +        const priv = self.private();
@@ -1070,9 +1524,17 @@ index 0000000..f44e341
 +            .label = label,
 +            .icon = icon,
 +            .close = close,
++            .subtitle_box = subtitle_box,
++            .branch_label = branch_label,
++            .subtitle_label = subtitle_label,
++            .indicator_box = indicator_box,
++            .bell_icon = bell_icon,
++            .readonly_icon = readonly_icon,
 +            .surface = surface,
-+            .pwd_handler = pwd_handler,
++            .handlers = handlers,
 +        }) catch return;
++
++        self.watchBranch(&priv.rows.items[priv.rows.items.len - 1]);
 +
 +        // A row realized mid-slide has to join the fade already in progress,
 +        // so its opacity comes from the animated width -- but its visibility,
@@ -1088,6 +1550,7 @@ index 0000000..f44e341
 +        close.as(gtk.Widget).setVisible(vis);
 +
 +        self.refreshNames();
++        self.applyRowContent(&priv.rows.items[priv.rows.items.len - 1]);
 +    }
 +
 +    fn rowUnbind(
@@ -1100,16 +1563,9 @@ index 0000000..f44e341
 +
 +        const box = gobject.Object.getData(obj, key_row_box) orelse return;
 +        const priv = self.private();
-+        for (priv.rows.items, 0..) |row, i| {
++        for (priv.rows.items, 0..) |*row, i| {
 +            if (@intFromPtr(row.box) == @intFromPtr(box)) {
-+                if (row.surface) |s| {
-+                    if (row.pwd_handler != 0) {
-+                        gobject.signalHandlerDisconnect(
-+                            s.as(gobject.Object),
-+                            row.pwd_handler,
-+                        );
-+                    }
-+                }
++                row.deinit(Application.default().allocator());
 +                _ = priv.rows.swapRemove(i);
 +                break;
 +            }
@@ -1130,14 +1586,24 @@ index 0000000..f44e341
 +    //---------------------------------------------------------------
 +    // Signal Handlers
 +
-+    fn surfacePwdChanged(
-+        _: *Surface,
-+        _: *gobject.ParamSpec,
++    fn surfaceChanged(
++        surface: *Surface,
++        pspec: *gobject.ParamSpec,
 +        self: *Self,
 +    ) callconv(.c) void {
++        // A cd can move a tab into a different repository, so the branch
++        // watch has to be repointed before the row is redrawn. Only for pwd:
++        // a title or a bell cannot change which repository a tab is in.
++        if (std.mem.eql(u8, std.mem.span(pspec.f_name orelse ""), "pwd")) {
++            for (self.private().rows.items) |*row| {
++                if (row.surface == surface) self.watchBranch(row);
++            }
++        }
++
 +        // One tab's cd can change another tab's label, by creating or
 +        // resolving a name collision, so recompute all of them.
 +        self.refreshNames();
++        self.refreshContent();
 +    }
 +
 +    fn closePageData(self: *Self, obj: *gobject.Object) void {
@@ -1541,10 +2007,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..4402cbf 100644
+index 9c0f115..5eb48b8 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,150 @@ label.resize-overlay {
+@@ -181,3 +181,175 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -1680,6 +2146,31 @@ index 9c0f115..4402cbf 100644
 +}
 +
 +/*
++ * Second line: branch and subtitle. Smaller and dimmer than the tab name, so
++ * the row still reads as one label with detail under it rather than two
++ * competing lines.
++ */
++.ghostty-tab-sidebar .ghostty-tab-branch,
++.ghostty-tab-sidebar .ghostty-tab-subtitle {
++  font-size: 0.8em;
++  opacity: 0.55;
++}
++
++/*
++ * A tab whose bell rang. The indicator icon says so when the sidebar is
++ * expanded, but on the rail there is no room for one, so the tab's own icon
++ * takes the accent colour instead -- the rail is precisely where an
++ * unattended tab needs to be able to shout.
++ *
++ * Literal first, then the variable, for the same cross-provider reason as the
++ * colors at the top of this section.
++ */
++.ghostty-tab-sidebar .ghostty-tab-attention .ghostty-tab-icon {
++  color: #3584e4;
++  color: var(--accent-color);
++}
++
++/*
 + * Scrim covering the terminal while the sidebar is expanded, from the
 + * sidebar's inner edge to the far side of the window. It is a sibling overlay
 + * drawn *under* the sidebar, so the sidebar's own area stays undimmed.
@@ -1695,12 +2186,619 @@ index 9c0f115..4402cbf 100644
 +.ghostty-tab-sidebar-dim.active {
 +  background-color: rgba(0, 0, 0, 0.35);
 +}
+diff --git a/src/apprt/gtk/tab_sidebar_git.zig b/src/apprt/gtk/tab_sidebar_git.zig
+new file mode 100644
+index 0000000..233e2d5
+--- /dev/null
++++ b/src/apprt/gtk/tab_sidebar_git.zig
+@@ -0,0 +1,230 @@
++//! Just enough git to put a branch name on a tab.
++//!
++//! This deliberately does not link libgit2 or shell out. A tab only needs the
++//! name of the branch its working directory is on, and that is one file:
++//! `HEAD`, whose entire contents are either `ref: refs/heads/<name>` or a raw
++//! object id. Reading it directly costs one `open` per change, keeps the
++//! dependency list of the patch at zero, and -- because it *is* a file -- lets
++//! a `GFileMonitor` tell us when to read it again instead of polling.
++//!
++//! What that gives up: anything requiring the index or the object database.
++//! There is no dirty marker and no ahead/behind count here, and adding either
++//! would mean a real git library.
++
++const std = @import("std");
++
++const log = std.log.scoped(.gtk_ghostty_tab_sidebar);
++
++/// Longest branch name we will show. Beyond this it is truncated with an
++/// ellipsis; a row is not the place to read a 200-character branch name.
++pub const max_branch_len: usize = 48;
++
++/// Walk up from `dir` looking for a repository, and return the path of the
++/// `HEAD` file that governs it. Caller owns the result.
++///
++/// Stops at the filesystem root. A worktree or submodule has `.git` as a
++/// *file* containing `gitdir: <path>`, which is followed once -- that is where
++/// its own HEAD lives, so a worktree correctly reports its own branch rather
++/// than the main checkout's.
++pub fn headPath(alloc: std.mem.Allocator, dir: []const u8) ?[:0]u8 {
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    var cur = dir;
++
++    while (true) {
++        const dot_git = std.fmt.bufPrint(&buf, "{s}/.git", .{cur}) catch return null;
++
++        if (std.fs.cwd().statFile(dot_git)) |stat| switch (stat.kind) {
++            .directory => return std.fmt.allocPrintSentinel(
++                alloc,
++                "{s}/HEAD",
++                .{dot_git},
++                0,
++            ) catch null,
++
++            .file => return headFromGitdirFile(alloc, cur, dot_git),
++
++            else => {},
++        } else |_| {}
++
++        const parent = std.fs.path.dirname(cur) orelse return null;
++        if (parent.len == cur.len) return null;
++        cur = parent;
++    }
++}
++
++/// `.git` is a file: read the `gitdir:` line out of it and point at the HEAD
++/// inside. The path may be relative, in which case it is relative to the
++/// directory holding the `.git` file.
++fn headFromGitdirFile(
++    alloc: std.mem.Allocator,
++    parent_dir: []const u8,
++    dot_git: []const u8,
++) ?[:0]u8 {
++    const contents = std.fs.cwd().readFileAlloc(alloc, dot_git, 4096) catch return null;
++    defer alloc.free(contents);
++
++    const prefix = "gitdir:";
++    if (!std.mem.startsWith(u8, contents, prefix)) return null;
++
++    const raw = std.mem.trim(u8, contents[prefix.len..], " \t\r\n");
++    if (raw.len == 0) return null;
++
++    return if (std.fs.path.isAbsolute(raw))
++        std.fmt.allocPrintSentinel(alloc, "{s}/HEAD", .{raw}, 0) catch null
++    else
++        std.fmt.allocPrintSentinel(alloc, "{s}/{s}/HEAD", .{ parent_dir, raw }, 0) catch null;
++}
++
++/// Read a branch name out of a `HEAD` file. Caller owns the result.
++///
++/// A detached HEAD holds an object id rather than a ref; it is shown as a
++/// short id, the way git itself describes that state.
++pub fn readBranch(alloc: std.mem.Allocator, head_path: []const u8) ?[]u8 {
++    const contents = std.fs.cwd().readFileAlloc(alloc, head_path, 4096) catch |err| {
++        // A repository being rebased or cloned can have HEAD momentarily
++        // absent. That is not worth a warning on every file-monitor event.
++        if (err != error.FileNotFound) {
++            log.debug("unable to read {s}: {}", .{ head_path, err });
++        }
++        return null;
++    };
++    defer alloc.free(contents);
++
++    const line = std.mem.trim(u8, contents, " \t\r\n");
++    if (line.len == 0) return null;
++
++    const name = if (std.mem.startsWith(u8, line, "ref:")) name: {
++        const ref = std.mem.trim(u8, line[4..], " \t");
++        // Show the last component: `refs/heads/foo/bar` is the branch
++        // `foo/bar`, so only the two known prefixes are stripped.
++        break :name stripPrefix(stripPrefix(ref, "refs/heads/"), "refs/");
++    } else line[0..@min(line.len, 7)];
++
++    if (name.len == 0) return null;
++
++    if (name.len > max_branch_len) {
++        return std.fmt.allocPrint(
++            alloc,
++            "{s}…",
++            .{name[0..max_branch_len]},
++        ) catch null;
++    }
++    return alloc.dupe(u8, name) catch null;
++}
++
++fn stripPrefix(s: []const u8, prefix: []const u8) []const u8 {
++    return if (std.mem.startsWith(u8, s, prefix)) s[prefix.len..] else s;
++}
++
++test "branch name from a symbolic HEAD" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    try tmp.dir.writeFile(.{ .sub_path = "HEAD", .data = "ref: refs/heads/main\n" });
++
++    const path = try tmp.dir.realpathAlloc(alloc, "HEAD");
++    defer alloc.free(path);
++
++    const branch = readBranch(alloc, path).?;
++    defer alloc.free(branch);
++    try testing.expectEqualStrings("main", branch);
++}
++
++test "slashes inside a branch name survive" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    try tmp.dir.writeFile(.{
++        .sub_path = "HEAD",
++        .data = "ref: refs/heads/feature/sidebar\n",
++    });
++
++    const path = try tmp.dir.realpathAlloc(alloc, "HEAD");
++    defer alloc.free(path);
++
++    const branch = readBranch(alloc, path).?;
++    defer alloc.free(branch);
++    try testing.expectEqualStrings("feature/sidebar", branch);
++}
++
++test "detached HEAD shows a short object id" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    try tmp.dir.writeFile(.{
++        .sub_path = "HEAD",
++        .data = "9fceb02d0ae598e95dc970b74767f19372d61af8\n",
++    });
++
++    const path = try tmp.dir.realpathAlloc(alloc, "HEAD");
++    defer alloc.free(path);
++
++    const branch = readBranch(alloc, path).?;
++    defer alloc.free(branch);
++    try testing.expectEqualStrings("9fceb02", branch);
++}
++
++test "a worktree's .git file is followed to its own HEAD" {
++    const testing = std.testing;
++    const alloc = testing.allocator;
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const root = try tmp.dir.realpathAlloc(alloc, ".");
++    defer alloc.free(root);
++
++    // The real repository, with the worktree's HEAD inside it.
++    try tmp.dir.makePath("main/.git/worktrees/wt");
++    try tmp.dir.writeFile(.{
++        .sub_path = "main/.git/worktrees/wt/HEAD",
++        .data = "ref: refs/heads/side\n",
++    });
++
++    // The worktree itself: `.git` is a file pointing back at that directory.
++    try tmp.dir.makePath("wt/deep/deeper");
++    const gitdir = try std.fmt.allocPrint(
++        alloc,
++        "gitdir: {s}/main/.git/worktrees/wt\n",
++        .{root},
++    );
++    defer alloc.free(gitdir);
++    try tmp.dir.writeFile(.{ .sub_path = "wt/.git", .data = gitdir });
++
++    // Found from a subdirectory, and it is the worktree's branch, not the
++    // main checkout's.
++    const from = try std.fmt.allocPrint(alloc, "{s}/wt/deep/deeper", .{root});
++    defer alloc.free(from);
++
++    const head = headPath(alloc, from).?;
++    defer alloc.free(head);
++
++    const branch = readBranch(alloc, head).?;
++    defer alloc.free(branch);
++    try testing.expectEqualStrings("side", branch);
++}
++
++test "a directory outside any repository has no HEAD" {
++    const testing = std.testing;
++    try testing.expectEqual(
++        @as(?[:0]u8, null),
++        headPath(testing.allocator, "/proc/self"),
++    );
++}
++
++test "a missing HEAD is not an error" {
++    const testing = std.testing;
++    try testing.expectEqual(
++        @as(?[]u8, null),
++        readBranch(testing.allocator, "/nonexistent/HEAD"),
++    );
++}
+diff --git a/src/apprt/gtk/tab_sidebar_prefs.zig b/src/apprt/gtk/tab_sidebar_prefs.zig
+new file mode 100644
+index 0000000..bd9208b
+--- /dev/null
++++ b/src/apprt/gtk/tab_sidebar_prefs.zig
+@@ -0,0 +1,365 @@
++//! The sidebar's preferences dialog.
++//!
++//! Built in code rather than as a blueprint. Every row here is mechanically
++//! derived from one field of `Settings`, and a blueprint would mean naming all
++//! thirteen of them twice -- once in the `.blp` and once when reading them
++//! back -- with nothing checking the two lists still agree.
++//!
++//! One handler serves every row. Rather than each widget knowing which field
++//! it owns, any change re-reads the whole dialog and rebuilds a `Settings`
++//! from it. That keeps the widget-to-field mapping in exactly one place, and
++//! means normalization runs against the complete picture: raising the icon
++//! size past the rail width has to be able to see the width.
++
++const std = @import("std");
++
++const adw = @import("adw");
++const gio = @import("gio");
++const gobject = @import("gobject");
++const gtk = @import("gtk");
++
++const Settings = @import("tab_sidebar_settings.zig");
++
++const log = std.log.scoped(.gtk_ghostty_tab_sidebar);
++
++/// Called whenever the dialog changes something, with the new settings
++/// already normalized. The sidebar applies them; this module also writes them
++/// to `sidebar.conf` so they outlive the window.
++pub const Apply = *const fn (ctx: ?*anyopaque, settings: Settings) void;
++
++const State = struct {
++    alloc: std.mem.Allocator,
++    apply: Apply,
++    ctx: ?*anyopaque,
++
++    /// Set while the dialog is writing its own widgets, so the change
++    /// handler does not treat normalization's corrections as user edits and
++    /// recurse.
++    updating: bool = false,
++
++    width: *adw.SpinRow,
++    expanded_width: *adw.SpinRow,
++    corner_radius: *adw.SpinRow,
++    icon_size: *adw.SpinRow,
++    animation_duration: *adw.SpinRow,
++    collapse_delay: *adw.SpinRow,
++
++    border: *adw.SwitchRow,
++    auto_hide: *adw.SwitchRow,
++    new_button: *adw.SwitchRow,
++    git_branch: *adw.SwitchRow,
++    indicators: *adw.SwitchRow,
++
++    mode: *adw.ComboRow,
++    subtitle: *adw.ComboRow,
++
++    fn read(self: *const State) Settings {
++        var s: Settings = .{
++            .width = spin(u16, self.width),
++            .expanded_width = spin(u16, self.expanded_width),
++            .corner_radius = spin(u8, self.corner_radius),
++            .icon_size = spin(u8, self.icon_size),
++            .animation_duration = spin(u16, self.animation_duration),
++            .collapse_delay = spin(u16, self.collapse_delay),
++            .border = self.border.getActive() != 0,
++            .auto_hide = self.auto_hide.getActive() != 0,
++            .new_button = self.new_button.getActive() != 0,
++            .git_branch = self.git_branch.getActive() != 0,
++            .indicators = self.indicators.getActive() != 0,
++            .mode = enumAt(Settings.Mode, self.mode),
++            .subtitle = enumAt(Settings.Subtitle, self.subtitle),
++        };
++        s.normalize();
++        return s;
++    }
++
++    fn write(self: *State, s: Settings) void {
++        self.updating = true;
++        defer self.updating = false;
++
++        setSpin(self.width, s.width);
++        setSpin(self.expanded_width, s.expanded_width);
++        setSpin(self.corner_radius, s.corner_radius);
++        setSpin(self.icon_size, s.icon_size);
++        setSpin(self.animation_duration, s.animation_duration);
++        setSpin(self.collapse_delay, s.collapse_delay);
++
++        self.border.setActive(@intFromBool(s.border));
++        self.auto_hide.setActive(@intFromBool(s.auto_hide));
++        self.new_button.setActive(@intFromBool(s.new_button));
++        self.git_branch.setActive(@intFromBool(s.git_branch));
++        self.indicators.setActive(@intFromBool(s.indicators));
++
++        self.mode.setSelected(@intFromEnum(s.mode));
++        self.subtitle.setSelected(@intFromEnum(s.subtitle));
++    }
++};
++
++fn spin(comptime T: type, row: *adw.SpinRow) T {
++    return std.math.lossyCast(T, @round(row.getValue()));
++}
++
++fn setSpin(row: *adw.SpinRow, value: anytype) void {
++    row.setValue(@floatFromInt(value));
++}
++
++fn enumAt(comptime T: type, row: *adw.ComboRow) T {
++    const i = row.getSelected();
++    const fields = @typeInfo(T).@"enum".fields;
++    inline for (fields, 0..) |f, idx| {
++        if (i == idx) return @field(T, f.name);
++    }
++    return @enumFromInt(0);
++}
++
++/// Open the dialog over `parent`.
++pub fn present(
++    alloc: std.mem.Allocator,
++    parent: *gtk.Widget,
++    current: Settings,
++    apply: Apply,
++    ctx: ?*anyopaque,
++) void {
++    const dialog = adw.PreferencesDialog.new();
++    dialog.as(adw.Dialog).setTitle("Tab Sidebar");
++
++    const page = adw.PreferencesPage.new();
++    page.setTitle("Sidebar");
++    page.setIconName("view-sidebar-start-symbolic");
++
++    const state = alloc.create(State) catch {
++        log.warn("unable to allocate sidebar preferences state", .{});
++        return;
++    };
++
++    // --- Size -----------------------------------------------------------
++    const size = group("Size", "Widths are in pixels. The rail width is what " ++
++        "the terminal makes room for; the expanded width is only how far the " ++
++        "panel opens.");
++    const width = spinRow("Rail width", null, 16, 200);
++    const expanded_width = spinRow("Expanded width", null, 16, 800);
++    const icon_size = spinRow(
++        "Icon size",
++        "The square each tab icon is drawn in. Shrinks to fit the rail.",
++        8,
++        128,
++    );
++    const corner_radius = spinRow(
++        "Corner radius",
++        "Rounding on the edge facing the terminal.",
++        0,
++        64,
++    );
++    size.add(width.as(gtk.Widget));
++    size.add(expanded_width.as(gtk.Widget));
++    size.add(icon_size.as(gtk.Widget));
++    size.add(corner_radius.as(gtk.Widget));
++    page.add(size);
++
++    // --- Behaviour ------------------------------------------------------
++    const behaviour = group(
++        "Behaviour",
++        "Hover rests as a rail and opens over the terminal. Always expanded " ++
++            "stays open and reserves its width. Always a rail never opens, " ++
++            "and puts tab names in tooltips instead.",
++    );
++    // No subtitle. An AdwComboRow gives its selected value whatever width
++    // the title and subtitle leave over, and three lines of explanation left
++    // "Always expanded" rendered as "A…".
++    const mode = comboRow(
++        "Mode",
++        null,
++        &.{ "Expand on hover", "Always expanded", "Always a rail" },
++    );
++    const auto_hide = switchRow(
++        "Hide with one tab",
++        "Give the space back to the terminal until a second tab exists.",
++    );
++    const new_button = switchRow("Show the New Tab button", null);
++    behaviour.add(mode.as(gtk.Widget));
++    behaviour.add(auto_hide.as(gtk.Widget));
++    behaviour.add(new_button.as(gtk.Widget));
++    page.add(behaviour);
++
++    // --- Tabs -----------------------------------------------------------
++    const tabs = group("Tabs", null);
++    const subtitle = comboRow(
++        "Second line",
++        null,
++        &.{ "Nothing", "Terminal title", "Working directory" },
++    );
++    const git_branch = switchRow(
++        "Show the git branch",
++        "Costs one file watch per tab on its repository's HEAD.",
++    );
++    const indicators = switchRow(
++        "Show status icons",
++        "A bell when a tab rings one, and a padlock when it is read-only.",
++    );
++    tabs.add(subtitle.as(gtk.Widget));
++    tabs.add(git_branch.as(gtk.Widget));
++    tabs.add(indicators.as(gtk.Widget));
++    page.add(tabs);
++
++    // --- Timing ---------------------------------------------------------
++    const timing = group("Timing", "In milliseconds.");
++    const animation_duration = spinRow(
++        "Slide duration",
++        "Zero switches between the two widths instantly.",
++        0,
++        2000,
++    );
++    const collapse_delay = spinRow(
++        "Collapse delay",
++        "How long the sidebar waits after the pointer leaves it.",
++        0,
++        5000,
++    );
++    const border = switchRow("Edge line", "A hairline against the terminal.");
++    timing.add(animation_duration.as(gtk.Widget));
++    timing.add(collapse_delay.as(gtk.Widget));
++    timing.add(border.as(gtk.Widget));
++    page.add(timing);
++
++    state.* = .{
++        .alloc = alloc,
++        .apply = apply,
++        .ctx = ctx,
++        .width = width,
++        .expanded_width = expanded_width,
++        .corner_radius = corner_radius,
++        .icon_size = icon_size,
++        .animation_duration = animation_duration,
++        .collapse_delay = collapse_delay,
++        .border = border,
++        .auto_hide = auto_hide,
++        .new_button = new_button,
++        .git_branch = git_branch,
++        .indicators = indicators,
++        .mode = mode,
++        .subtitle = subtitle,
++    };
++
++    // Fill the widgets before connecting, so seeding them is not mistaken
++    // for thirteen separate edits.
++    state.write(current);
++
++    // Three handlers rather than one, because the connect helper types the
++    // callback against the emitting widget. They all do the same thing.
++    inline for (.{ "width", "expanded_width", "corner_radius", "icon_size", "animation_duration", "collapse_delay" }) |name| {
++        _ = gobject.Object.signals.notify.connect(
++            @field(state, name),
++            *State,
++            &spinChanged,
++            state,
++            .{ .detail = "value" },
++        );
++    }
++    inline for (.{ "border", "auto_hide", "new_button", "git_branch", "indicators" }) |name| {
++        _ = gobject.Object.signals.notify.connect(
++            @field(state, name),
++            *State,
++            &switchChanged,
++            state,
++            .{ .detail = "active" },
++        );
++    }
++    inline for (.{ "mode", "subtitle" }) |name| {
++        _ = gobject.Object.signals.notify.connect(
++            @field(state, name),
++            *State,
++            &comboChanged,
++            state,
++            .{ .detail = "selected" },
++        );
++    }
++
++    dialog.add(page);
++
++    _ = adw.Dialog.signals.closed.connect(
++        dialog.as(adw.Dialog),
++        *State,
++        &closed,
++        state,
++        .{},
++    );
++
++    dialog.as(adw.Dialog).present(parent);
++}
++
++fn spinChanged(_: *adw.SpinRow, _: *gobject.ParamSpec, state: *State) callconv(.c) void {
++    changed(state);
++}
++
++fn switchChanged(_: *adw.SwitchRow, _: *gobject.ParamSpec, state: *State) callconv(.c) void {
++    changed(state);
++}
++
++fn comboChanged(_: *adw.ComboRow, _: *gobject.ParamSpec, state: *State) callconv(.c) void {
++    changed(state);
++}
++
++fn changed(state: *State) void {
++    if (state.updating) return;
++
++    const s = state.read();
++    state.apply(state.ctx, s);
++
++    // Normalization may have moved a value the user just typed -- an icon
++    // bigger than the rail, an odd difference. Show them what actually took
++    // effect rather than leaving the widget disagreeing with the sidebar.
++    state.write(s);
++
++    s.save(state.alloc) catch |err| {
++        log.warn("unable to save sidebar settings: {}", .{err});
++    };
++}
++
++fn closed(_: *adw.Dialog, state: *State) callconv(.c) void {
++    state.alloc.destroy(state);
++}
++
++//---------------------------------------------------------------
++// Row builders
++
++fn group(title: [*:0]const u8, description: ?[*:0]const u8) *adw.PreferencesGroup {
++    const g = adw.PreferencesGroup.new();
++    g.setTitle(title);
++    if (description) |d| g.setDescription(d);
++    return g;
++}
++
++fn spinRow(
++    title: [*:0]const u8,
++    subtitle: ?[*:0]const u8,
++    min: f64,
++    max: f64,
++) *adw.SpinRow {
++    const adjustment = gtk.Adjustment.new(min, min, max, 1, 10, 0);
++    const row = adw.SpinRow.new(adjustment, 1, 0);
++    row.as(adw.PreferencesRow).setTitle(title);
++    if (subtitle) |s| row.as(adw.ActionRow).setSubtitle(s);
++    return row;
++}
++
++fn switchRow(title: [*:0]const u8, subtitle: ?[*:0]const u8) *adw.SwitchRow {
++    const row = adw.SwitchRow.new();
++    row.as(adw.PreferencesRow).setTitle(title);
++    if (subtitle) |s| row.as(adw.ActionRow).setSubtitle(s);
++    return row;
++}
++
++fn comboRow(
++    title: [*:0]const u8,
++    subtitle: ?[*:0]const u8,
++    labels: []const [*:0]const u8,
++) *adw.ComboRow {
++    const row = adw.ComboRow.new();
++    row.as(adw.PreferencesRow).setTitle(title);
++    if (subtitle) |s| row.as(adw.ActionRow).setSubtitle(s);
++
++    const list = gtk.StringList.new(null);
++    for (labels) |l| list.append(l);
++    row.setModel(list.as(gio.ListModel));
++    return row;
++}
 diff --git a/src/apprt/gtk/tab_sidebar_settings.zig b/src/apprt/gtk/tab_sidebar_settings.zig
 new file mode 100644
-index 0000000..667bab5
+index 0000000..e9f061f
 --- /dev/null
 +++ b/src/apprt/gtk/tab_sidebar_settings.zig
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,332 @@
 +//! Live settings for the vertical tab sidebar.
 +//!
 +//! Every value here also exists as a `gtk-tabs-sidebar-*` config option. The
@@ -1935,9 +3033,11 @@ index 0000000..667bab5
 +    const w = buf.writer(alloc);
 +
 +    try w.writeAll(
-+        \\# Written by Ghostty's vertical tab sidebar. Edits are kept, but the
-+        \\# file is rewritten whenever a setting changes from the sidebar menu,
-+        \\# so comments of your own will not survive.
++        \\# Written by Ghostty's vertical tab sidebar.
++        \\#
++        \\# Values you change by hand are read back, but the whole file is
++        \\# rewritten whenever a setting changes in Sidebar Preferences, so
++        \\# comments and ordering of your own will not survive that.
 +        \\#
 +        \\# These override the matching gtk-tabs-sidebar-* options in your
 +        \\# Ghostty config. Delete a line to go back to following the config.
@@ -2033,10 +3133,10 @@ index 0000000..667bab5
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..a9cc837
+index 0000000..e6aa2f3
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,220 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -2222,11 +3322,17 @@ index 0000000..a9cc837
 +    }
 +  }
 +
-+  // The sidebar's own settings -- width, animation timing, which side it
-+  // sits on -- are config values, and Ghostty never writes its own config
-+  // file, so the honest entry point is to open it.
++  // The sidebar's own settings live in a file it owns, so unlike the rest of
++  // Ghostty it can offer a dialog that writes them. The config entries stay:
++  // they are still where everything *else* is set, and where these options
++  // come from until the dialog overrides one.
 +  section {
 +    label: _("Sidebar");
++
++    item {
++      label: _("Sidebar Preferences…");
++      action: "sidebar.preferences";
++    }
 +
 +    item {
 +      label: _("Open Configuration");

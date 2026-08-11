@@ -1,7 +1,8 @@
 # WIP — sidebar config options, settings file, richer tabs, prefs menu
 
-Steps 1-3 are **done, building green and visually verified**; they are in
-`patches/0001-gtk-vertical-tab-sidebar.patch`. Steps 4-6 remain.
+**All six steps are done, building green and visually verified.** They are in
+`patches/0001-gtk-vertical-tab-sidebar.patch`, which applies cleanly to a
+pristine `v1.3.1`.
 
 The build tree now lives in `build/` (gitignored) rather than `/tmp`. It was
 moved there on 2026-08-09 because `/tmp` is a 16G tmpfs with `usrquota` and the
@@ -48,41 +49,75 @@ Decided with the user on 2026-08-09:
 ### Verification
 
 `zig build test` does **not** cover any of this: the GTK apprt is absent from
-Ghostty's test binary (grep it for `GhosttyTabSidebar` — zero hits), so the
-settings tests never ran there. They were run standalone instead, with `glib`
-and `src/config.zig` stubbed: all 4 pass.
+Ghostty's test binary (grep it for `GhosttyTabSidebar` — zero hits), so a
+green suite says nothing about this work. It stays green — 2568/2590, 22
+skipped, same as before the change — but the 10 tests that matter were run
+standalone:
+
+```sh
+# tab_sidebar_git.zig has no GTK imports, so it runs as-is
+build/zig-0.15.2/zig test build/ghostty/src/apprt/gtk/tab_sidebar_git.zig
+
+# tab_sidebar_settings.zig needs glib and src/config.zig stubbed
+sed 's|@import("../../config.zig")|@import("cfg")|' …/tab_sidebar_settings.zig > settings.zig
+zig test --dep glib --dep cfg -Mroot=settings.zig -Mglib=glib.zig -Mcfg=config.zig
+```
 
 Geometry was measured off Xvfb screenshots (see the visual-testing notes):
-width 54 → 54px, width 72 → 72px, expanded 260 → 260px, all exact. A 3000ms
-`animation-duration` was caught mid-slide at 170px, and a 3000ms
-`collapse-delay` was still open 1.5s after the pointer left.
+width 54 → 54px, width 72 → 72px, expanded 260 → 260px, chip = icon-size at
+both widths, all exact. A 3000ms `animation-duration` was caught mid-slide at
+170px, and a 3000ms `collapse-delay` was still open 1.5s after the pointer
+left. Rail mode with every row option on still measures exactly 54px.
 
-## Remaining
+**Known cosmetic defect, pre-existing:** the chip sits 1px right of the rail's
+centre (margins 12/10 at the default, 25/23 at width 72) even though the CSS
+margins are symmetric. Identical before and after this work, so something in
+the viewport/scrollbar allocation adds it, not the margins.
 
-4. **Runtime CSS.** Corner radius, icon size and the chip margins currently
-   live in the static `style.css`, so configurable sizes need a generated
-   stylesheet. `application.zig` already keeps a `css_provider` plus a
-   `custom_css_providers` list (see ~line 368 and ~1105) — add a sidebar-owned
-   `gtk.CssProvider` regenerated whenever settings change.
-   *Reminder:* the chip margins are a derived pair — rows get
-   `(width - icon_size) / 2`, and the "+" button gets that minus 6, because a
-   flat button carries 6px of Adwaita padding that our `padding: 0` never wins
-   against. Recompute both, never hardcode. `Settings.iconMargin` and
-   `Settings.newButtonMargin` already derive the pair — use them.
-   You can see the gap this leaves today: run with
-   `gtk-tabs-sidebar-width = 72`, and the selected row's chip renders as a
-   wide pill, because the CSS is still centring for a 54px rail.
-5. Row content: subtitle line, indicators, git branch via a `GFileMonitor` on
-   the repo's `HEAD` for each tab's pwd.
-6. `Adw.PreferencesDialog` opened from the sidebar's "…" menu, wired to
-   `Settings.save`, applying live.
+4. **Runtime CSS.** `TabSidebar.writeCss` emits the configurable half of the
+   sidebar's stylesheet into a provider added to the display at
+   `STYLE_PROVIDER_PRIORITY_APPLICATION + 4` — above `style.css` so it wins,
+   below `STYLE_PROVIDER_PRIORITY_USER` so a user's `gtk-custom-css` still
+   beats it. Removed from the display on dispose, or a closed window keeps
+   styling the open ones.
 
-## The 12 options
+   The chip margins are the derived pair the earlier notes warned about, and
+   they now come from `Settings.iconMargin` / `newButtonMargin` rather than
+   being written down. Measured: `icon-size = 32` → a 32×32 chip,
+   `icon-size = 24` → 24×24, at both the default and a 72px rail.
 
-They are in the patch now, so they are no longer transcribed here. Two of them
-(`corner-radius`, `icon-size`) are only half-wired: the Zig side reads them,
-but the CSS side is step 4, so changing them today moves the icon box without
-moving the chip drawn behind it.
+5. **Row content.** A second line (branch, then the `subtitle` setting) and
+   status icons (bell, read-only — both real Surface properties,
+   `getBellRinging` / `getReadonly`). Branch comes from
+   `tab_sidebar_git.zig`: no libgit2 and no subprocess, just the `HEAD` file,
+   with a `GFileMonitor` on it because a checkout rewrites it.
+
+   Two things that are not obvious:
+   - Indicators are shown **only when expanded**, because the row box has to
+     measure exactly one chip across on the rail or the rail grows over the
+     terminal. So a ringing bell *also* puts `ghostty-tab-attention` on the
+     row, which tints the tab icon — the rail is where an unattended tab most
+     needs to shout, and it is where there is no room for an icon.
+   - With `subtitle = title`, the name no longer gets its `— title` suffix
+     when two tabs share a directory: the subtitle line is already showing
+     it, and the screenshot had it printed twice on one row.
+
+6. **Preferences dialog.** `tab_sidebar_prefs.zig`, built in code rather than
+   as a blueprint — thirteen rows mechanically derived from thirteen fields,
+   and a `.blp` would mean naming them all twice with nothing checking the
+   lists agree. One handler serves every row: any change re-reads the whole
+   dialog, so the widget-to-field mapping exists once and `normalize` runs
+   against the complete picture. Reached from the menu via a `sidebar.*`
+   action group inserted on the widget.
+
+   Verified end to end under Xvfb: menu → dialog → increment expanded width
+   → the panel reflowed to exactly 265px live, `sidebar.conf` was written,
+   and a restart came back at 265 against a config saying 260.
+
+   *Beware:* `adw.SpinRow`/`SwitchRow` are `opaque` in this gobject binding
+   but do have methods (`pub const new = adw_...`) — grepping for
+   `^    pub fn ` finds only `as` and will mislead you into thinking they are
+   unusable.
 
 ## Scope warning worth revisiting
 
