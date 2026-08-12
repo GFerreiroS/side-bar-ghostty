@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..ca5fa21
+index 0000000..d623a84
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1843 @@
+@@ -0,0 +1,1849 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -1487,12 +1487,18 @@ index 0000000..ca5fa21
 +    ///
 +    /// `gtk_widget_set_margin_*` is not part of the cascade at all, so there is
 +    /// nothing left for a theme to win against.
-+    fn insetToChip(self: *Self, widget: *gtk.Widget) void {
++    fn insetToChip(self: *Self, widget: *gtk.Widget, expanded_inset: bool) void {
 +        const priv = self.private();
-+        const margin: c_int = if (priv.collapsed)
-+            @intCast(priv.settings.iconMargin())
++        // Collapsed, the inset centres a chip in the rail and everything needs
++        // it. Expanded, the rows already get the panel's row inset from the
++        // stylesheet, so only the buttons need it here -- giving it to the
++        // rows as well would apply it twice and push them out instead.
++        const margin: c_int = @intCast(if (priv.collapsed)
++            priv.settings.iconMargin()
++        else if (expanded_inset)
++            Settings.expanded_inset
 +        else
-+            0;
++            0);
 +        widget.setMarginStart(margin);
 +        widget.setMarginEnd(margin);
 +    }
@@ -1507,12 +1513,12 @@ index 0000000..ca5fa21
 +            // parent of the box we built -- inset that, not our box, or the
 +            // highlight stays full width while its contents move.
 +            const item = row.box.as(gtk.Widget).getParent() orelse continue;
-+            self.insetToChip(item);
++            self.insetToChip(item, false);
 +        }
 +
-+        self.insetToChip(priv.new_tab_button.as(gtk.Widget));
-+        self.insetToChip(priv.menu_button.as(gtk.Widget));
-+        self.insetToChip(priv.overview_button.as(gtk.Widget));
++        self.insetToChip(priv.new_tab_button.as(gtk.Widget), true);
++        self.insetToChip(priv.menu_button.as(gtk.Widget), false);
++        self.insetToChip(priv.overview_button.as(gtk.Widget), false);
 +    }
 +
 +    /// Indicators are only ever shown expanded; see `Row.wants_indicators`.
@@ -3071,10 +3077,10 @@ index 0000000..a4b8c97
 +}
 diff --git a/src/apprt/gtk/tab_sidebar_settings.zig b/src/apprt/gtk/tab_sidebar_settings.zig
 new file mode 100644
-index 0000000..dc103e9
+index 0000000..1887ac9
 --- /dev/null
 +++ b/src/apprt/gtk/tab_sidebar_settings.zig
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,413 @@
 +//! Live settings for the vertical tab sidebar.
 +//!
 +//! Every value here also exists as a `gtk-tabs-sidebar-*` config option. The
@@ -3262,6 +3268,13 @@ index 0000000..dc103e9
 +/// `padding: 0` does not win against. Hardcoding either one drifts the moment
 +/// the width changes.
 +pub const button_padding: u16 = 6;
++
++/// How far the expanded panel insets its rows from its own edge.
++///
++/// Shared deliberately. The rows get it from the stylesheet and the "New Tab"
++/// button gets it as a widget margin, and when only the rows had it the "+"
++/// jumped 7px left of the tab icons the moment the sidebar opened.
++pub const expanded_inset: u16 = 7;
 +
 +/// Natural size of a symbolic icon. Themes draw them at this by default, and
 +/// the sidebar was designed around a glyph this size sitting in a larger chip.
