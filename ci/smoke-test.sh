@@ -52,10 +52,19 @@ mkdir -p "$XDG_CONFIG_HOME"
 measure() {
     local want=$1 shot="$WORK/shot-$1.png" pid wid
 
+    # auto-hide off so a single tab is enough.
+    #
+    # This used to open a second tab with a synthetic ctrl+shift+t, which is
+    # not reliable: the keystroke often does not reach the terminal, the
+    # sidebar stays hidden, and both measurements then read the terminal
+    # background instead -- giving a delta of zero and a failure that says
+    # "sidebar did not track its configured width" when the sidebar was simply
+    # never shown. That is what made this job flaky in CI.
     cat >"$WORK/ghostty.conf" <<EOF
 gtk-tabs-location = left
 gtk-tabs-sidebar-width = $want
 gtk-tabs-sidebar-mode = hover
+gtk-tabs-sidebar-auto-hide = false
 window-width = 100
 window-height = 30
 EOF
@@ -78,8 +87,6 @@ EOF
         return 1
     fi
 
-    # The sidebar hides itself while there is only one tab, by design.
-    xdotool key --window "$wid" ctrl+shift+t
     sleep 3
     import -window root "$shot"
 
