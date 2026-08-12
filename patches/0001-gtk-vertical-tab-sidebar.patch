@@ -2074,10 +2074,10 @@ index f13b4f4..d7466de 100644
 +  background-color: var(--sidebar-bg-color);
 +}
 diff --git a/src/apprt/gtk/css/style.css b/src/apprt/gtk/css/style.css
-index 9c0f115..5eb48b8 100644
+index 9c0f115..5547171 100644
 --- a/src/apprt/gtk/css/style.css
 +++ b/src/apprt/gtk/css/style.css
-@@ -181,3 +181,175 @@ label.resize-overlay {
+@@ -181,3 +181,191 @@ label.resize-overlay {
    margin: 0;
    padding: 0;
  }
@@ -2119,8 +2119,24 @@ index 9c0f115..5eb48b8 100644
 +  box-shadow: inset 1px 0 var(--sidebar-border-color);
 +}
 +
-+.ghostty-tab-sidebar list {
++/*
++ * Everything between the sidebar and its rows must be transparent, or the
++ * sidebar ends up two-toned: its own colour behind the "New Tab" row and the
++ * theme's list colour behind the tabs, with a rounded corner where they meet.
++ *
++ * `list` alone is not enough and never was. That is GtkListBox's CSS node;
++ * GtkListView's is `listview`, so the original rule matched nothing. It went
++ * unnoticed under Adwaita, where the list colour happens to equal the sidebar
++ * colour -- and showed up immediately under a third-party theme (MacTahoe)
++ * where it does not. The scrolled window and viewport paint too, so they are
++ * named here as well rather than waiting for the next theme to prove it.
++ */
++.ghostty-tab-sidebar list,
++.ghostty-tab-sidebar listview,
++.ghostty-tab-sidebar scrolledwindow,
++.ghostty-tab-sidebar viewport {
 +  background-color: transparent;
++  background-image: none;
 +}
 +
 +/*
