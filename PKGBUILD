@@ -62,7 +62,7 @@ _archive="$_pkgname-$pkgver"
 source=("$url/archive/v$pkgver/$_archive.tar.gz"
         0001-gtk-vertical-tab-sidebar.patch)
 sha256sums=('265837d3026b433f0e6b4e49d43153b915b0a19513f7edd8a8e693c559bd415b'
-            'fd5b7cea85052697abd36e0273c452229c5d3368e708496788ca98b1a0b43ed3')
+            '5b70aea50d568356080c14af91537ec81e68f23f877c7f7f72a0a538fe61c21b')
 
 # Zig 0.15.x only.
 #

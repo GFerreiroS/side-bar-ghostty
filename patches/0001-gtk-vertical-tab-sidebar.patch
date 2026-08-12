@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..c6d5a0a
+index 0000000..ca5fa21
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1841 @@
+@@ -0,0 +1,1843 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -684,10 +684,10 @@ index 0000000..c6d5a0a
 +        try writer.print(
 +            \\.ghostty-tab-sidebar .ghostty-sidebar-top-bar image,
 +            \\.ghostty-tab-sidebar .ghostty-tab-icon {{
-+            \\  -gtk-icon-size: {[chip]d}px;
++            \\  -gtk-icon-size: {[glyph]d}px;
 +            \\}}
 +            \\
-+        , .{ .chip = s.icon_size });
++        , .{ .glyph = s.glyphSize() });
 +
 +        // The hairline along the terminal-facing edge. Dropping it means
 +        // restating every box-shadow rule rather than unsetting one, because
@@ -1431,20 +1431,20 @@ index 0000000..c6d5a0a
 +                const paintable = theme.lookupIcon(
 +                    name,
 +                    null,
-+                    size,
++                    @intCast(self.private().settings.glyphSize()),
 +                    1,
 +                    .none,
 +                    .{ .force_symbolic = true },
 +                );
 +                defer paintable.unref();
 +                image.setFromPaintable(paintable.as(gdk.Paintable));
-+                sizeIcon(image, size);
++                self.sizeIcon(image, size);
 +                return;
 +            }
 +        }
 +
 +        image.setFromIconName(name);
-+        sizeIcon(image, size);
++        self.sizeIcon(image, size);
 +    }
 +
 +    fn setButtonIcon(self: *Self, button: *gtk.Button, name: [*:0]const u8, size: c_int) void {
@@ -1468,9 +1468,11 @@ index 0000000..c6d5a0a
 +    /// centres the overflow -- which is the whole column sliding off its axis,
 +    /// with the "+" and the tab icons landing on different ones.
 +    /// `setPixelSize` is what actually resizes the glyph.
-+    fn sizeIcon(icon: *gtk.Image, size: c_int) void {
-+        icon.setPixelSize(size);
-+        icon.as(gtk.Widget).setSizeRequest(size, size);
++    fn sizeIcon(self: *Self, icon: *gtk.Image, chip: c_int) void {
++        // The chip is the box; the glyph is smaller and sits inside it. Only
++        // the box gets the configured size.
++        icon.setPixelSize(@intCast(self.private().settings.glyphSize()));
++        icon.as(gtk.Widget).setSizeRequest(chip, chip);
 +    }
 +
 +    /// Inset a widget so it occupies a centred chip of `icon_size` in the rail.
@@ -3069,10 +3071,10 @@ index 0000000..a4b8c97
 +}
 diff --git a/src/apprt/gtk/tab_sidebar_settings.zig b/src/apprt/gtk/tab_sidebar_settings.zig
 new file mode 100644
-index 0000000..7bff740
+index 0000000..dc103e9
 --- /dev/null
 +++ b/src/apprt/gtk/tab_sidebar_settings.zig
-@@ -0,0 +1,386 @@
+@@ -0,0 +1,406 @@
 +//! Live settings for the vertical tab sidebar.
 +//!
 +//! Every value here also exists as a `gtk-tabs-sidebar-*` config option. The
@@ -3260,6 +3262,26 @@ index 0000000..7bff740
 +/// `padding: 0` does not win against. Hardcoding either one drifts the moment
 +/// the width changes.
 +pub const button_padding: u16 = 6;
++
++/// Natural size of a symbolic icon. Themes draw them at this by default, and
++/// the sidebar was designed around a glyph this size sitting in a larger chip.
++pub const natural_glyph: u8 = 16;
++
++/// How big to draw the glyph itself, as opposed to the chip around it.
++///
++/// `icon_size` is the *chip* -- the square an icon sits in, and the size of
++/// the rounded highlight behind a selected tab. It was `icon_chip` before it
++/// became configurable, set with `set_size_request`, which raises only a
++/// minimum: the glyph kept its natural 16px and the chip was the 32px box
++/// around it. That gap is the design.
++///
++/// Forcing the glyph to the chip size instead -- which is what `set_pixel_size`
++/// on `icon_size` did -- doubled every icon at the same setting and filled the
++/// chip edge to edge. So the glyph gets its natural size, shrunk only when the
++/// chip is too small to hold it.
++pub fn glyphSize(self: *const Settings) u8 {
++    return @min(self.icon_size, natural_glyph);
++}
 +
 +pub fn iconMargin(self: *const Settings) u16 {
 +    return (self.width -| @as(u16, self.icon_size)) / 2;
