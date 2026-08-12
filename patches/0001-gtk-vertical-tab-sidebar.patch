@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..7be66f9
+index 0000000..7f85fc7
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1845 @@
+@@ -0,0 +1,1832 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -83,12 +83,6 @@ index 0000000..7be66f9
 +    // the icon can be centred now lives.
 +    //
 +    // Two things stayed fixed, because neither is a matter of taste:
-+
-+    /// Fraction of the slide that passes before labels begin to appear. The
-+    /// same curve run backwards means they are gone well before the rail has
-+    /// finished closing, so collapsing reads as a slide rather than the text
-+    /// snapping out from under you.
-+    const label_fade_start: f64 = 0.35;
 +
 +    /// Extra inset on the terminal beyond the rail's own width. Zero: the
 +    /// breathing room is inside the rail width now, painted in the sidebar's
@@ -262,6 +256,11 @@ index 0000000..7be66f9
 +        /// Cached; see `iconTheme`.
 +        icon_theme: ?*gtk.IconTheme = null,
 +
++        /// The images we put inside the overview and menu buttons, kept so
++        /// their box can be resized when the sidebar opens or closes.
++        overview_icon: ?*gtk.Image = null,
++        menu_icon: ?*gtk.Image = null,
++
 +        /// Pending collapse timer, running while the pointer is away.
 +        hover_timer: ?c_uint = null,
 +
@@ -280,11 +279,12 @@ index 0000000..7be66f9
 +        /// times a second, which is what made the slide stutter.
 +        last_inset: c_int = -1,
 +
-+        /// Must start true, matching how the blueprint builds the labels.
-+        /// Seeding it false made the first hide compare equal and get
-+        /// skipped, so they were never hidden at all -- leaving a 98px row
-+        /// clipped into a 46px rail.
-+        last_labels_shown: bool = true,
++        /// Whether the expanded-only content is currently mapped. Not simply
++        /// `!collapsed`: it is set true as soon as expanding starts and false
++        /// only once collapsing has finished, so the row never changes size
++        /// mid-slide.
++        content_shown: bool = false,
++
 +
 +        /// Currently realized rows.
 +        rows: std.ArrayListUnmanaged(Row) = .empty,
@@ -562,8 +562,13 @@ index 0000000..7be66f9
 +
 +        // The overview and menu buttons build their own images from an
 +        // icon-name, which would come from the desktop theme. Give them ours.
-+        self.setButtonIcon(priv.overview_button, "view-grid-symbolic", chip);
-+        self.setMenuIcon(priv.menu_button, "open-menu-symbolic", chip);
++        // Sized to the glyph, not the chip. These two do not stand in the
++        // icon column -- expanded they sit together at the trailing edge, and
++        // a chip-sized box would pad them apart from each other by the
++        // difference. On the rail the button's own min-width makes the chip.
++        const glyph: c_int = @intCast(priv.settings.glyphSize());
++        self.setButtonIcon(priv.overview_button, "view-grid-symbolic", glyph);
++        self.setMenuIcon(priv.menu_button, "open-menu-symbolic", glyph);
 +
 +        self.updateCss();
 +        self.applyCollapsed();
@@ -668,8 +673,15 @@ index 0000000..7be66f9
 +            \\  margin: 6px 0 2px;
 +            \\  padding: 0;
 +            \\  min-height: {[chip]d}px;
++            \\}}
++            \\
++            \\/* The chip width is a rail thing: it is what makes a lone icon
++            \\ * a square. Expanded it only pads the overview and menu buttons
++            \\ * apart from each other and from the panel edge. */
++            \\.ghostty-tab-sidebar.collapsed button.flat {{
 +            \\  min-width: {[chip]d}px;
 +            \\}}
++
 +            \\
 +        , .{ .chip = s.icon_size });
 +
@@ -732,12 +744,12 @@ index 0000000..7be66f9
 +        const priv = self.private();
 +        const collapsed = priv.collapsed;
 +
-+        // Map the labels for the state we are entering before the slide
-+        // starts, not on the animation's first frame. The animation may not
-+        // get a frame for a while -- or at all, if the window is not being
-+        // drawn -- and until it does the rows would still be asking for the
-+        // width of the state we just left.
-+        self.applyLabelFade(priv.current_width);
++        // Expanding maps the content before the slide starts, so the rows are
++        // already their final size and the panel merely uncovers them.
++        // Collapsing leaves it mapped; `animationDone` hides it once the
++        // panel has actually closed.
++        if (!collapsed) priv.content_shown = true;
++        self.applyContentVisibility();
 +
 +        self.animateWidth(self.targetWidth());
 +        self.toggleCssClass("collapsed", collapsed);
@@ -749,22 +761,6 @@ index 0000000..7be66f9
 +        self.applyRailInsets();
 +    }
 +
-+    /// How visible labels should be at the given sidebar width. Tying this to
-+    /// the animated width rather than to the collapsed flag is what keeps the
-+    /// text and the rail in step.
-+    fn labelOpacity(self: *Self, width: f64) f64 {
-+        const priv = self.private();
-+        const rail: f64 = @floatFromInt(priv.settings.width);
-+        const open: f64 = @floatFromInt(priv.settings.expanded_width);
-+        if (open <= rail) return 1;
-+
-+        const progress = std.math.clamp((width - rail) / (open - rail), 0, 1);
-+        return std.math.clamp(
-+            (progress - label_fade_start) / (1 - label_fade_start),
-+            0,
-+            1,
-+        );
-+    }
 +
 +    /// Fade every label and close button to match the current width, and map
 +    /// them according to whether the sidebar is *meant* to be open.
@@ -778,61 +774,48 @@ index 0000000..7be66f9
 +    /// 46px, so a 217px row got clipped to an empty stripe with its icon
 +    /// pushed out of sight. Keying visibility off `collapsed` makes that
 +    /// disagreement impossible: the row asks for exactly the state we are in.
-+    fn applyLabelFade(self: *Self, width: f64) void {
++    /// Show or hide everything that only exists in the expanded panel.
++    ///
++    /// No fade, and no reveal: the row is built at its final size and the
++    /// panel slides to uncover it. There used to be an opacity ramp keyed to
++    /// the animated width, which made the close button and the labels arrive
++    /// in the last third of the slide -- read as the tab "growing" just as the
++    /// panel finished.
++    ///
++    /// The direction matters. Expanding shows the content immediately, so the
++    /// row is full height before the first frame. Collapsing leaves it alone
++    /// and hides it in `animationDone`: hiding it up front drops each row from
++    /// two text lines to one icon while the panel is still wide, which is the
++    /// vertical squeeze the icons appeared to do on the way in.
++    fn applyContentVisibility(self: *Self) void {
 +        const priv = self.private();
-+        const opacity = self.labelOpacity(width);
 +
-+        const shown = !priv.collapsed;
-+        const flipped = shown != priv.last_labels_shown;
-+        priv.last_labels_shown = shown;
++        const shown = priv.content_shown;
 +        const vis: c_int = @intFromBool(shown);
 +
 +        for (priv.rows.items) |*row| {
-+            const text = row.text_box.as(gtk.Widget);
-+            const close = row.close.as(gtk.Widget);
-+            text.setOpacity(opacity);
-+            close.setOpacity(opacity);
-+            row.indicator_box.as(gtk.Widget).setOpacity(opacity);
-+            if (flipped) {
-+                text.setVisible(vis);
-+                close.setVisible(vis);
-+                self.applyIndicatorVisibility(row);
-+            }
++            row.text_box.as(gtk.Widget).setVisible(vis);
++            row.close.as(gtk.Widget).setVisible(vis);
++            self.applyIndicatorVisibility(row);
 +        }
 +
-+        const label = priv.new_tab_label.as(gtk.Widget);
-+        label.setOpacity(opacity);
-+
-+        // The overview and menu buttons live in the same row as "New Tab".
-+        // They only exist once there is room for them, and the "+" gives up
-+        // its width to make space rather than the row rearranging.
-+        const overview = priv.overview_button.as(gtk.Widget);
-+        const menu = priv.menu_button.as(gtk.Widget);
-+        overview.setOpacity(opacity);
++        priv.new_tab_label.as(gtk.Widget).setVisible(vis);
++        priv.overview_button.as(gtk.Widget).setVisible(vis);
 +
 +        // Except in `rail` mode, where the sidebar never widens and hiding
-+        // the menu with the labels would strand the user: the preferences
-+        // that could put the sidebar back are behind that button, and there
-+        // is no other way to reach them short of editing a file by hand. So
-+        // it stays, and the top bar turns vertical to give it a row of its
-+        // own -- side by side, two 32px chips do not fit in a 54px rail and
-+        // the second one would be clipped off the edge.
++        // the menu would strand the user: the preferences that could put the
++        // sidebar back are behind that button, and there is no other way to
++        // reach them short of editing a file by hand. So it stays, and the
++        // top bar turns vertical to give it a row of its own -- side by side,
++        // two chips do not fit in the rail and the second would be clipped.
 +        const pinned = priv.settings.mode == .rail;
-+        menu.setOpacity(if (pinned) 1 else opacity);
-+
-+        if (flipped) {
-+            label.setVisible(vis);
-+            overview.setVisible(vis);
-+        }
-+
-+        // Unconditional: `flipped` only fires when the collapsed state
-+        // changes, and in rail mode it never does, so a mode switch would
-+        // otherwise never reach this. GTK ignores a set to the current value.
-+        menu.setVisible(if (pinned) 1 else vis);
++        priv.menu_button.as(gtk.Widget).setVisible(if (pinned) 1 else vis);
 +
 +        priv.top_bar.as(gtk.Orientable).setOrientation(
 +            if (pinned) .vertical else .horizontal,
 +        );
++
++        self.applyRailInsets();
 +    }
 +
 +    /// Push `width` into the size request, the terminal's inset and the label
@@ -849,7 +832,6 @@ index 0000000..7be66f9
 +        self.as(gtk.Widget).setSizeRequest(@intFromFloat(width), -1);
 +
 +        self.applyInset(width);
-+        self.applyLabelFade(width);
 +    }
 +
 +    /// Animate the sidebar width to `target`, starting from wherever the
@@ -891,6 +873,13 @@ index 0000000..7be66f9
 +    fn animationDone(anim: *adw.Animation, self: *Self) callconv(.c) void {
 +        const priv = self.private();
 +        self.applyWidth(anim.getValue());
++
++        // The panel has finished closing, so the rows can drop to one line
++        // now without that change being visible as a squeeze mid-slide.
++        if (priv.collapsed and priv.content_shown) {
++            priv.content_shown = false;
++            self.applyContentVisibility();
++        }
 +
 +        // Hide on `done` rather than trusting the width to reach zero.
 +        if (!priv.active) self.as(gtk.Widget).setVisible(0);
@@ -1447,12 +1436,14 @@ index 0000000..7be66f9
 +        const image = gtk.Image.new();
 +        self.setIcon(image, name, size);
 +        button.setChild(image.as(gtk.Widget));
++        self.private().overview_icon = image;
 +    }
 +
 +    fn setMenuIcon(self: *Self, button: *gtk.MenuButton, name: [*:0]const u8, size: c_int) void {
 +        const image = gtk.Image.new();
 +        self.setIcon(image, name, size);
 +        button.setChild(image.as(gtk.Widget));
++        self.private().menu_icon = image;
 +    }
 +
 +    /// Draw an icon at exactly `size` pixels square.
@@ -1471,50 +1462,54 @@ index 0000000..7be66f9
 +        icon.as(gtk.Widget).setSizeRequest(chip, chip);
 +    }
 +
-+    /// Inset a widget so it occupies a centred chip of `icon_size` in the rail.
-+    ///
-+    /// Done with widget margins rather than CSS. The margins were CSS until a
-+    /// third-party GTK theme (MacTahoe) was tried, and then they simply lost:
-+    /// the rows rendered 42px wide in a 54px rail instead of 32, with the "New
-+    /// Tab" button on a different axis again. Raising our provider above
-+    /// `PRIORITY_USER` did not help, and the theme uses no `!important`, so
-+    /// the cascade was never going to be a reliable place to put geometry that
-+    /// has to be exact.
-+    ///
-+    /// `gtk_widget_set_margin_*` is not part of the cascade at all, so there is
-+    /// nothing left for a theme to win against.
-+    fn insetToChip(self: *Self, widget: *gtk.Widget) void {
-+        const priv = self.private();
-+        // The same inset in both states, on purpose: it is what makes the
-+        // icon column stand still.
-+        //
-+        // Width animates over `animation_duration`, but a margin change is
-+        // instant, so any difference between the two states plays as the
-+        // icons jumping to their new column and the panel then catching up --
-+        // and on the way back, as the "+" snapping to the middle before
-+        // sliding out. Holding the inset fixed means opening the panel only
-+        // ever reveals text to the right of a column that never moves.
-+        const margin: c_int = @intCast(priv.settings.iconMargin());
-+        widget.setMarginStart(margin);
-+        widget.setMarginEnd(margin);
-+    }
 +
-+    /// Apply that inset to every part of the rail that has to share one axis:
-+    /// each tab row, the "+" and the menu button.
++    /// Apply that inset to everything in the rail that shares the icon column.
++    ///
++    /// The tab rows and the "New Tab" button always take it, because their
++    /// icons are the column and it must not move when the panel opens. The
++    /// overview and menu buttons only take it collapsed -- expanded they sit
++    /// together at the panel's trailing edge, and an inset there would space
++    /// them apart and leave the "+" ending well short of the edge.
 +    fn applyRailInsets(self: *Self) void {
 +        const priv = self.private();
++        const chip: c_int = @intCast(priv.settings.iconMargin());
++        const trailing: c_int = if (priv.collapsed) chip else 0;
 +
 +        for (priv.rows.items) |row| {
 +            // The chip background is drawn on the list item, which is the
 +            // parent of the box we built -- inset that, not our box, or the
 +            // highlight stays full width while its contents move.
 +            const item = row.box.as(gtk.Widget).getParent() orelse continue;
-+            self.insetToChip(item);
++            item.setMarginStart(chip);
++            item.setMarginEnd(chip);
 +        }
 +
-+        self.insetToChip(priv.new_tab_button.as(gtk.Widget));
-+        self.insetToChip(priv.menu_button.as(gtk.Widget));
-+        self.insetToChip(priv.overview_button.as(gtk.Widget));
++        // Expanded, the button keeps its leading inset so the "+" stays in
++        // the column, and gives up its trailing one so it runs to the buttons.
++        const new_tab = priv.new_tab_button.as(gtk.Widget);
++        new_tab.setMarginStart(chip);
++        new_tab.setMarginEnd(trailing);
++
++        for ([_]*gtk.Widget{
++            priv.overview_button.as(gtk.Widget),
++            priv.menu_button.as(gtk.Widget),
++        }) |w| {
++            w.setMarginStart(trailing);
++            w.setMarginEnd(trailing);
++        }
++
++        // Collapsed, these have to sit in the icon column like everything
++        // else -- which in `rail` mode the menu button really does, pinned
++        // under the "+". Expanded they pair up at the trailing edge, where a
++        // chip-sized box would only hold them apart.
++        const box: c_int = if (priv.collapsed)
++            chip
++        else
++            @intCast(priv.settings.glyphSize());
++        for ([_]?*gtk.Image{ priv.overview_icon, priv.menu_icon }) |maybe| {
++            const image = maybe orelse continue;
++            image.as(gtk.Widget).setSizeRequest(box, box);
++        }
 +    }
 +
 +    /// Indicators are only ever shown expanded; see `Row.wants_indicators`.
@@ -1726,16 +1721,8 @@ index 0000000..7be66f9
 +
 +        self.watchBranch(&priv.rows.items[priv.rows.items.len - 1]);
 +
-+        // A row realized mid-slide has to join the fade already in progress,
-+        // so its opacity comes from the animated width -- but its visibility,
-+        // like every other row's, comes from the collapsed flag. Set both
-+        // directly rather than through applyLabelFade: that only touches
-+        // visibility when the shared state has just flipped, which would
-+        // leave this brand-new row mapped exactly as the blueprint built it.
-+        const opacity = self.labelOpacity(priv.current_width);
-+        const vis: c_int = @intFromBool(!priv.collapsed);
-+        text_box.as(gtk.Widget).setOpacity(opacity);
-+        close.as(gtk.Widget).setOpacity(opacity);
++        // A row realized mid-slide joins whatever state the others are in.
++        const vis: c_int = @intFromBool(priv.content_shown);
 +        text_box.as(gtk.Widget).setVisible(vis);
 +        close.as(gtk.Widget).setVisible(vis);
 +
