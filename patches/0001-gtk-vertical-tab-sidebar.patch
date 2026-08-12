@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..7f85fc7
+index 0000000..5f97d09
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1832 @@
+@@ -0,0 +1,1844 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -1473,7 +1473,6 @@ index 0000000..7f85fc7
 +    fn applyRailInsets(self: *Self) void {
 +        const priv = self.private();
 +        const chip: c_int = @intCast(priv.settings.iconMargin());
-+        const trailing: c_int = if (priv.collapsed) chip else 0;
 +
 +        for (priv.rows.items) |row| {
 +            // The chip background is drawn on the list item, which is the
@@ -1488,14 +1487,27 @@ index 0000000..7f85fc7
 +        // the column, and gives up its trailing one so it runs to the buttons.
 +        const new_tab = priv.new_tab_button.as(gtk.Widget);
 +        new_tab.setMarginStart(chip);
-+        new_tab.setMarginEnd(trailing);
++        new_tab.setMarginEnd(if (priv.collapsed) chip else 0);
 +
++        // No margins on these, ever.
++        //
++        // Collapsed they are centred instead. A GtkMenuButton wraps its button
++        // in a node with padding of its own, so chip margins on top of that
++        // made the top bar's natural width exceed the rail -- and GtkViewport
++        // centres content it cannot fit, which slides the whole column left
++        // rather than clipping on the right. That is the same failure that
++        // once put the icons 9px off axis, and it is why the rail looked
++        // uncentred in `rail` mode while hover mode measured exact.
++        //
++        // Centring the widget also puts the menu glyph on the column without
++        // having to know what that wrapper's padding is.
 +        for ([_]*gtk.Widget{
 +            priv.overview_button.as(gtk.Widget),
 +            priv.menu_button.as(gtk.Widget),
 +        }) |w| {
-+            w.setMarginStart(trailing);
-+            w.setMarginEnd(trailing);
++            w.setMarginStart(0);
++            w.setMarginEnd(0);
++            w.setHalign(if (priv.collapsed) .center else .fill);
 +        }
 +
 +        // Collapsed, these have to sit in the icon column like everything
