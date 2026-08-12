@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..3efc01d
+index 0000000..b5406ad
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1697 @@
+@@ -0,0 +1,1756 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -289,6 +289,7 @@ index 0000000..3efc01d
 +        list_view: *gtk.ListView,
 +        top_bar: *gtk.Box,
 +        new_tab_button: *gtk.Button,
++        new_tab_box: *gtk.Box,
 +        new_tab_icon: *gtk.Image,
 +        new_tab_label: *gtk.Label,
 +        overview_button: *gtk.Button,
@@ -570,9 +571,20 @@ index 0000000..3efc01d
 +    /// into the binary. So the configurable half of it is re-emitted here and
 +    /// loaded over the top.
 +    ///
-+    /// Priority sits one above the application sheet so these win, and below
-+    /// `STYLE_PROVIDER_PRIORITY_USER` so a user's `gtk-custom-css` still
-+    /// beats us -- they asked for that by hand; we are only a default.
++    /// Priority sits one above `STYLE_PROVIDER_PRIORITY_USER`, which is where
++    /// GTK loads `~/.config/gtk-4.0/gtk.css`.
++    ///
++    /// That is not greed. A desktop theme installed there -- MacTahoe, in the
++    /// case that found this -- is a full stylesheet with hundreds of rules on
++    /// `button`, `image` and `listview`, and at any lower priority it wins
++    /// against ours. The visible result was the "New Tab" button sitting 8px
++    /// off the axis of the tab icons, because the theme's button padding beat
++    /// the margins we compute from the configured width.
++    ///
++    /// These rules are scoped entirely to `.ghostty-tab-sidebar`, so nothing
++    /// outside the sidebar is affected. The cost is that `gtk-custom-css`
++    /// can no longer restyle the sidebar's geometry -- colours and anything
++    /// we do not set still work.
 +    fn updateCss(self: *Self) void {
 +        const priv = self.private();
 +        const alloc = Application.default().allocator();
@@ -595,7 +607,7 @@ index 0000000..3efc01d
 +            gtk.StyleContext.addProviderForDisplay(
 +                display,
 +                p.as(gtk.StyleProvider),
-+                gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 4,
++                gtk.STYLE_PROVIDER_PRIORITY_USER + 1,
 +            );
 +            priv.css_provider = p;
 +            break :provider p;
@@ -634,20 +646,17 @@ index 0000000..3efc01d
 +        // are a derived pair; see `Settings.newButtonMargin`.
 +        try writer.print(
 +            \\.ghostty-tab-sidebar.collapsed listview > row {{
-+            \\  margin: 2px {[m]d}px;
++            \\  margin: 2px 0;
 +            \\  min-height: {[chip]d}px;
 +            \\}}
 +            \\.ghostty-tab-sidebar button.flat {{
-+            \\  margin: 6px {[bm]d}px 2px;
++            \\  margin: 6px 0 2px;
++            \\  padding: 0;
 +            \\  min-height: {[chip]d}px;
 +            \\  min-width: {[chip]d}px;
 +            \\}}
 +            \\
-+        , .{
-+            .m = s.iconMargin(),
-+            .bm = s.newButtonMargin(),
-+            .chip = s.icon_size,
-+        });
++        , .{ .chip = s.icon_size });
 +
 +        // Size the glyphs themselves, not just the boxes around them.
 +        //
@@ -658,7 +667,8 @@ index 0000000..3efc01d
 +        // is pinned visible -- makes that button wider than the rail and puts
 +        // it on a different axis from the tab icons below it.
 +        try writer.print(
-+            \\.ghostty-tab-sidebar .ghostty-sidebar-top-bar image {{
++            \\.ghostty-tab-sidebar .ghostty-sidebar-top-bar image,
++            \\.ghostty-tab-sidebar .ghostty-tab-icon {{
 +            \\  -gtk-icon-size: {[chip]d}px;
 +            \\}}
 +            \\
@@ -720,6 +730,8 @@ index 0000000..3efc01d
 +        priv.new_tab_button.as(gtk.Widget).setVisible(
 +            @intFromBool(priv.settings.new_button),
 +        );
++
++        self.applyRailInsets();
 +    }
 +
 +    /// How visible labels should be at the given sidebar width. Tying this to
@@ -802,6 +814,11 @@ index 0000000..3efc01d
 +        // changes, and in rail mode it never does, so a mode switch would
 +        // otherwise never reach this. GTK ignores a set to the current value.
 +        menu.setVisible(if (pinned) 1 else vis);
++
++        // On the rail the "+" is a lone icon and must centre in the button;
++        // expanded it leads the "New Tab" label and must not.
++        priv.new_tab_box.as(gtk.Widget).setHalign(if (shown) .start else .center);
++
 +        priv.top_bar.as(gtk.Orientable).setOrientation(
 +            if (pinned) .vertical else .horizontal,
 +        );
@@ -1371,6 +1388,46 @@ index 0000000..3efc01d
 +        icon.as(gtk.Widget).setSizeRequest(size, size);
 +    }
 +
++    /// Inset a widget so it occupies a centred chip of `icon_size` in the rail.
++    ///
++    /// Done with widget margins rather than CSS. The margins were CSS until a
++    /// third-party GTK theme (MacTahoe) was tried, and then they simply lost:
++    /// the rows rendered 42px wide in a 54px rail instead of 32, with the "New
++    /// Tab" button on a different axis again. Raising our provider above
++    /// `PRIORITY_USER` did not help, and the theme uses no `!important`, so
++    /// the cascade was never going to be a reliable place to put geometry that
++    /// has to be exact.
++    ///
++    /// `gtk_widget_set_margin_*` is not part of the cascade at all, so there is
++    /// nothing left for a theme to win against.
++    fn insetToChip(self: *Self, widget: *gtk.Widget) void {
++        const priv = self.private();
++        const margin: c_int = if (priv.collapsed)
++            @intCast(priv.settings.iconMargin())
++        else
++            0;
++        widget.setMarginStart(margin);
++        widget.setMarginEnd(margin);
++    }
++
++    /// Apply that inset to every part of the rail that has to share one axis:
++    /// each tab row, the "+" and the menu button.
++    fn applyRailInsets(self: *Self) void {
++        const priv = self.private();
++
++        for (priv.rows.items) |row| {
++            // The chip background is drawn on the list item, which is the
++            // parent of the box we built -- inset that, not our box, or the
++            // highlight stays full width while its contents move.
++            const item = row.box.as(gtk.Widget).getParent() orelse continue;
++            self.insetToChip(item);
++        }
++
++        self.insetToChip(priv.new_tab_button.as(gtk.Widget));
++        self.insetToChip(priv.menu_button.as(gtk.Widget));
++        self.insetToChip(priv.overview_button.as(gtk.Widget));
++    }
++
 +    /// Indicators are only ever shown expanded; see `Row.wants_indicators`.
 +    fn applyIndicatorVisibility(self: *Self, row: *const Row) void {
 +        row.indicator_box.as(gtk.Widget).setVisible(
@@ -1595,6 +1652,7 @@ index 0000000..3efc01d
 +
 +        self.refreshNames();
 +        self.applyRowContent(&priv.rows.items[priv.rows.items.len - 1]);
++        self.applyRailInsets();
 +    }
 +
 +    fn rowUnbind(
@@ -1704,6 +1762,7 @@ index 0000000..3efc01d
 +            class.bindTemplateChildPrivate("list_view", .{});
 +            class.bindTemplateChildPrivate("top_bar", .{});
 +            class.bindTemplateChildPrivate("new_tab_button", .{});
++            class.bindTemplateChildPrivate("new_tab_box", .{});
 +            class.bindTemplateChildPrivate("new_tab_icon", .{});
 +            class.bindTemplateChildPrivate("new_tab_label", .{});
 +            class.bindTemplateChildPrivate("overview_button", .{});
@@ -3298,10 +3357,10 @@ index 0000000..bf74940
 +}
 diff --git a/src/apprt/gtk/ui/1.5/tab-sidebar.blp b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
 new file mode 100644
-index 0000000..d5a97fb
+index 0000000..9ca0988
 --- /dev/null
 +++ b/src/apprt/gtk/ui/1.5/tab-sidebar.blp
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,234 @@
 +using Gtk 4.0;
 +using Adw 1;
 +
@@ -3375,7 +3434,12 @@ index 0000000..d5a97fb
 +        // centre. With those gone both the button and the rows are bare
 +        // chips of the same size and the viewport centres them on the same
 +        // axis.
-+        child: Gtk.Box {
++        // halign is switched from Zig: `start` expanded, so the icon leads the
++        // label, and `center` on the rail, so the icon centres in the button
++        // rather than sitting against whatever padding the GTK theme gives it.
++        // Leaving it at `start` let a third-party theme's button padding push
++        // the "+" several pixels off the axis of the tab icons below.
++        child: Gtk.Box new_tab_box {
 +          orientation: horizontal;
 +          spacing: 6;
 +          halign: start;
