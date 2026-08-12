@@ -24,10 +24,10 @@ index 942666c..1fb158c 100644
  pub fn Common(
 diff --git a/src/apprt/gtk/class/tab_sidebar.zig b/src/apprt/gtk/class/tab_sidebar.zig
 new file mode 100644
-index 0000000..b5406ad
+index 0000000..c6d5a0a
 --- /dev/null
 +++ b/src/apprt/gtk/class/tab_sidebar.zig
-@@ -0,0 +1,1756 @@
+@@ -0,0 +1,1841 @@
 +const std = @import("std");
 +
 +const adw = @import("adw");
@@ -259,6 +259,9 @@ index 0000000..b5406ad
 +        /// has no per-widget providers.
 +        css_provider: ?*gtk.CssProvider = null,
 +
++        /// Cached; see `iconTheme`.
++        icon_theme: ?*gtk.IconTheme = null,
++
 +        /// Pending collapse timer, running while the pointer is away.
 +        hover_timer: ?c_uint = null,
 +
@@ -431,6 +434,11 @@ index 0000000..b5406ad
 +            priv.css_provider = null;
 +        }
 +
++        if (priv.icon_theme) |t| {
++            t.unref();
++            priv.icon_theme = null;
++        }
++
 +        if (priv.config) |config| {
 +            config.unref();
 +            priv.config = null;
@@ -547,8 +555,15 @@ index 0000000..b5406ad
 +        // Rows are sized here as well as in `rowSetup`, because the ones
 +        // already realized would otherwise keep the old size until recycled.
 +        const chip: c_int = @intCast(priv.settings.icon_size);
-+        sizeIcon(priv.new_tab_icon, chip);
-+        for (priv.rows.items) |row| sizeIcon(row.icon, chip);
++        self.setIcon(priv.new_tab_icon, "tab-new-symbolic", chip);
++        for (priv.rows.items) |row| {
++            self.setIcon(row.icon, "utilities-terminal-symbolic", chip);
++        }
++
++        // The overview and menu buttons build their own images from an
++        // icon-name, which would come from the desktop theme. Give them ours.
++        self.setButtonIcon(priv.overview_button, "view-grid-symbolic", chip);
++        self.setMenuIcon(priv.menu_button, "open-menu-symbolic", chip);
 +
 +        self.updateCss();
 +        self.applyCollapsed();
@@ -1374,6 +1389,76 @@ index 0000000..b5406ad
 +        }
 +    }
 +
++    /// The icon theme the rail draws from.
++    ///
++    /// Not the desktop's. A rail is a column of glyphs that have to read as
++    /// one set, and icon themes disagree wildly about what these names look
++    /// like: MacTahoe draws `tab-new-symbolic` as a bare cross spanning most
++    /// of its box, next to a `utilities-terminal-symbolic` that is a small
++    /// boxed glyph, so the "+" towered over the tabs. Adwaita draws both as
++    /// boxed shapes of the same weight, which is the design this was built
++    /// against.
++    ///
++    /// So the sidebar pins its own theme and stops being at the mercy of
++    /// whichever one the desktop happens to use. `gtk-tabs-sidebar-theme-icons`
++    /// hands it back for anyone who would rather match their desktop.
++    ///
++    /// One instance, cached: constructing a GtkIconTheme rescans directories.
++    fn iconTheme(self: *Self) ?*gtk.IconTheme {
++        const priv = self.private();
++        if (priv.icon_theme) |t| return t;
++
++        const display = gdk.Display.getDefault() orelse return null;
++
++        // Start from the display's theme so the search path is right, then
++        // override only which theme is picked out of it.
++        const shared = gtk.IconTheme.getForDisplay(display);
++        const theme = gtk.IconTheme.new();
++        theme.setSearchPath(shared.getSearchPath());
++        theme.setThemeName(icon_theme_name);
++
++        priv.icon_theme = theme;
++        return theme;
++    }
++
++    /// Adwaita ships with GTK itself, so this is always present.
++    const icon_theme_name = "Adwaita";
++
++    /// Point an image at `name`, drawn at `size`.
++    fn setIcon(self: *Self, image: *gtk.Image, name: [*:0]const u8, size: c_int) void {
++        if (!self.private().settings.theme_icons) {
++            if (self.iconTheme()) |theme| {
++                const paintable = theme.lookupIcon(
++                    name,
++                    null,
++                    size,
++                    1,
++                    .none,
++                    .{ .force_symbolic = true },
++                );
++                defer paintable.unref();
++                image.setFromPaintable(paintable.as(gdk.Paintable));
++                sizeIcon(image, size);
++                return;
++            }
++        }
++
++        image.setFromIconName(name);
++        sizeIcon(image, size);
++    }
++
++    fn setButtonIcon(self: *Self, button: *gtk.Button, name: [*:0]const u8, size: c_int) void {
++        const image = gtk.Image.new();
++        self.setIcon(image, name, size);
++        button.setChild(image.as(gtk.Widget));
++    }
++
++    fn setMenuIcon(self: *Self, button: *gtk.MenuButton, name: [*:0]const u8, size: c_int) void {
++        const image = gtk.Image.new();
++        self.setIcon(image, name, size);
++        button.setChild(image.as(gtk.Widget));
++    }
++
 +    /// Draw an icon at exactly `size` pixels square.
 +    ///
 +    /// Both calls are needed and they do different jobs. `setSizeRequest` only
@@ -1464,8 +1549,8 @@ index 0000000..b5406ad
 +        // the content wider than the rail.
 +        const box = gtk.Box.new(.horizontal, 6);
 +
-+        const icon = gtk.Image.newFromIconName("utilities-terminal-symbolic");
-+        sizeIcon(icon, @intCast(self.private().settings.icon_size));
++        const icon = gtk.Image.new();
++        self.setIcon(icon, "utilities-terminal-symbolic", @intCast(self.private().settings.icon_size));
 +        // Named so the bell can tint this icon and nothing else in the row --
 +        // not the indicators, not the close button's glyph.
 +        icon.as(gtk.Widget).addCssClass("ghostty-tab-icon");
@@ -2566,10 +2651,10 @@ index 0000000..233e2d5
 +}
 diff --git a/src/apprt/gtk/tab_sidebar_prefs.zig b/src/apprt/gtk/tab_sidebar_prefs.zig
 new file mode 100644
-index 0000000..8ec8664
+index 0000000..a4b8c97
 --- /dev/null
 +++ b/src/apprt/gtk/tab_sidebar_prefs.zig
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,412 @@
 +//! The sidebar's preferences dialog.
 +//!
 +//! Built in code rather than as a blueprint. Every row here is mechanically
@@ -2625,6 +2710,7 @@ index 0000000..8ec8664
 +    new_button: *adw.SwitchRow,
 +    git_branch: *adw.SwitchRow,
 +    indicators: *adw.SwitchRow,
++    theme_icons: *adw.SwitchRow,
 +
 +    mode: *adw.ComboRow,
 +    subtitle: *adw.ComboRow,
@@ -2642,6 +2728,7 @@ index 0000000..8ec8664
 +            .new_button = self.new_button.getActive() != 0,
 +            .git_branch = self.git_branch.getActive() != 0,
 +            .indicators = self.indicators.getActive() != 0,
++            .theme_icons = self.theme_icons.getActive() != 0,
 +            .mode = enumAt(Settings.Mode, self.mode),
 +            .subtitle = enumAt(Settings.Subtitle, self.subtitle),
 +        };
@@ -2665,6 +2752,7 @@ index 0000000..8ec8664
 +        self.new_button.setActive(@intFromBool(s.new_button));
 +        self.git_branch.setActive(@intFromBool(s.git_branch));
 +        self.indicators.setActive(@intFromBool(s.indicators));
++        self.theme_icons.setActive(@intFromBool(s.theme_icons));
 +
 +        self.mode.setSelected(@intFromEnum(s.mode));
 +        self.subtitle.setSelected(@intFromEnum(s.subtitle));
@@ -2776,6 +2864,13 @@ index 0000000..8ec8664
 +    tabs.add(subtitle.as(gtk.Widget));
 +    tabs.add(git_branch.as(gtk.Widget));
 +    tabs.add(indicators.as(gtk.Widget));
++
++    const theme_icons = switchRow(
++        "Use the desktop icon theme",
++        "Off by default: the sidebar draws from Adwaita so its icons read as " ++
++            "one set whatever theme you use.",
++    );
++    tabs.add(theme_icons.as(gtk.Widget));
 +    page.add(tabs);
 +
 +    // --- Timing ---------------------------------------------------------
@@ -2828,6 +2923,7 @@ index 0000000..8ec8664
 +        .new_button = new_button,
 +        .git_branch = git_branch,
 +        .indicators = indicators,
++        .theme_icons = theme_icons,
 +        .mode = mode,
 +        .subtitle = subtitle,
 +    };
@@ -2847,7 +2943,7 @@ index 0000000..8ec8664
 +            .{ .detail = "value" },
 +        );
 +    }
-+    inline for (.{ "border", "auto_hide", "new_button", "git_branch", "indicators" }) |name| {
++    inline for (.{ "border", "auto_hide", "new_button", "git_branch", "indicators", "theme_icons" }) |name| {
 +        _ = gobject.Object.signals.notify.connect(
 +            @field(state, name),
 +            *State,
@@ -2973,10 +3069,10 @@ index 0000000..8ec8664
 +}
 diff --git a/src/apprt/gtk/tab_sidebar_settings.zig b/src/apprt/gtk/tab_sidebar_settings.zig
 new file mode 100644
-index 0000000..bf74940
+index 0000000..7bff740
 --- /dev/null
 +++ b/src/apprt/gtk/tab_sidebar_settings.zig
-@@ -0,0 +1,378 @@
+@@ -0,0 +1,386 @@
 +//! Live settings for the vertical tab sidebar.
 +//!
 +//! Every value here also exists as a `gtk-tabs-sidebar-*` config option. The
@@ -3029,6 +3125,10 @@ index 0000000..bf74940
 +subtitle: Subtitle = .title,
 +indicators: bool = true,
 +
++/// Draw icons from Adwaita rather than the desktop theme; see
++/// `gtk-tabs-sidebar-theme-icons`.
++theme_icons: bool = false,
++
 +/// The file we own, relative to the user's config directory.
 +const file_name = "sidebar.conf";
 +
@@ -3049,6 +3149,7 @@ index 0000000..bf74940
 +    .{ "git-branch", "git_branch" },
 +    .{ "subtitle", "subtitle" },
 +    .{ "indicators", "indicators" },
++    .{ "theme-icons", "theme_icons" },
 +};
 +
 +/// Start from the config. This is the baseline the file is layered onto.
@@ -3067,6 +3168,7 @@ index 0000000..bf74940
 +        .git_branch = config.@"gtk-tabs-sidebar-git-branch",
 +        .subtitle = config.@"gtk-tabs-sidebar-subtitle",
 +        .indicators = config.@"gtk-tabs-sidebar-indicators",
++        .theme_icons = config.@"gtk-tabs-sidebar-theme-icons",
 +    };
 +}
 +
@@ -3320,25 +3422,27 @@ index 0000000..bf74940
 +    s.normalize();
 +    try testing.expectEqual(@as(u8, 32), s.icon_size);
 +    try testing.expectEqual(@as(u16, 11), s.iconMargin());
-+    try testing.expectEqual(@as(u16, 5), s.newButtonMargin());
 +
-+    // A chip wider than the rail is clamped so that the rows still have
-+    // `2 * button_padding` to spare, because the "New Tab" button is aligned
-+    // by subtracting that from their margin.
++    // A chip wider than the rail is clamped, with room left over so the
++    // margins stay positive.
 +    var big: Settings = .{ .width = 20, .icon_size = 64 };
 +    big.normalize();
 +    try testing.expectEqual(@as(u8, 8), big.icon_size);
 +    try testing.expectEqual(@as(u16, 6), big.iconMargin());
-+    try testing.expectEqual(@as(u16, 0), big.newButtonMargin());
 +
-+    // The pair must never come apart: whatever the width, a row's margin and
-+    // the button's margin have to differ by exactly the button's own padding.
++    // Everything on the rail shares one margin, so everything shares one
++    // axis. This used to subtract `button_padding` from the "New Tab"
++    // button's, on the belief that a flat button carries Adwaita padding our
++    // `padding: 0` cannot beat. Measured against the pixels, it does not: the
++    // subtraction put the "+" six pixels left of the tab icons at every
++    // width, including the default.
 +    for ([_]u16{ 16, 17, 33, 50, 54, 72, 200 }) |w| {
 +        var each: Settings = .{ .width = w, .icon_size = 32 };
 +        each.normalize();
++        try testing.expectEqual(each.iconMargin(), each.newButtonMargin());
 +        try testing.expectEqual(
-+            Settings.button_padding,
-+            each.iconMargin() - each.newButtonMargin(),
++            each.width,
++            each.iconMargin() * 2 + each.icon_size,
 +        );
 +    }
 +}
@@ -3672,7 +3776,7 @@ index b66a930..cc77400 100644
        }
      }
 diff --git a/src/config/Config.zig b/src/config/Config.zig
-index 278ffd7..8bc35e0 100644
+index 278ffd7..f813de8 100644
 --- a/src/config/Config.zig
 +++ b/src/config/Config.zig
 @@ -3572,7 +3572,13 @@ else
@@ -3690,7 +3794,7 @@ index 278ffd7..8bc35e0 100644
  ///
  /// When `hidden` is set, a tab button displaying the number of tabs will appear
  /// in the title bar. It has the ability to open a tab overview for displaying
-@@ -3581,6 +3587,85 @@ else
+@@ -3581,6 +3587,95 @@ else
  /// with keybinds.
  @"gtk-tabs-location": GtkTabsLocation = .top,
  
@@ -3773,10 +3877,20 @@ index 278ffd7..8bc35e0 100644
 +/// rings its bell while unfocused, and a padlock when it is read-only.
 +@"gtk-tabs-sidebar-indicators": bool = true,
 +
++/// If `true`, draw the sidebar's icons from your desktop's icon theme. If
++/// `false`, the default, draw them from Adwaita regardless of your theme.
++///
++/// The sidebar is a single column of glyphs that has to read as one set, and
++/// icon themes disagree about these names: some draw "new tab" as a bare cross
++/// filling its box, next to a terminal icon that is a small boxed glyph, so the
++/// two do not sit together. Pinning one theme keeps the rail coherent. Set this
++/// to `true` if matching your desktop matters more.
++@"gtk-tabs-sidebar-theme-icons": bool = false,
++
  /// If this is `true`, the titlebar will be hidden when the window is maximized,
  /// and shown when the titlebar is unmaximized. GTK only.
  ///
-@@ -8985,6 +9070,22 @@ pub const GtkSingleInstance = enum {
+@@ -8985,6 +9080,22 @@ pub const GtkSingleInstance = enum {
  pub const GtkTabsLocation = enum {
      top,
      bottom,
